@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
-//! v4: mobile perf-budget checks (P_* layer).
+//! v4: mobile perf-budget checks (P_* layer). v5 adds per-class
+//! budgets (--class), a bone budget, and asset-convention warnings
+//! (normal maps, piece skinning, weapon shape).
 //!
 //! Advisory only: over-budget assets WARN, never fail. Correctness
 //! (R_*/W_*/X_*) stays FAIL-level; budgets answer "will this hurt on
@@ -11,6 +13,7 @@
 
 use crate::weights::SkinStats;
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
@@ -28,9 +31,65 @@ pub const D_MAX_TEXTURE_DIM: u32 = 2048;
 /// standard (Adreno/Xclipse/Mali handle it natively). Tighten via
 /// --budget for low-end targets.
 pub const D_MAX_INFLUENCES: usize = 4;
+/// Loose generic ceiling: 256 matrices x 64 B = 16 KB, exactly the
+/// guaranteed UBO size — anything past this cannot upload its palette
+/// everywhere. Per-class mobile budgets sit well below (see
+/// `Budget::mobile_for`).
+pub const D_MAX_BONES: usize = 256;
 
-pub const BUDGET_KEYS: &str =
-    "max_tris_per_mesh, max_verts_per_mesh, max_texture_dim, max_influences";
+pub const BUDGET_KEYS: &str = "max_tris_per_mesh, max_verts_per_mesh, \
+     max_texture_dim, max_influences, max_bones";
+
+/// Asset class for per-class budgets (`--class`). Heroes are the
+/// player cast, NPCs background humanoids, monsters creatures and
+/// bosses, props static kit pieces, weapons hand-held props.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AssetClass {
+    Hero,
+    Npc,
+    Monster,
+    Prop,
+    Weapon,
+}
+
+pub const CLASS_NAMES: &str = "hero, npc, monster, prop, weapon";
+
+pub fn parse_class(name: &str) -> Option<AssetClass> {
+    match name {
+        "hero" => Some(AssetClass::Hero),
+        "npc" => Some(AssetClass::Npc),
+        "monster" => Some(AssetClass::Monster),
+        "prop" => Some(AssetClass::Prop),
+        "weapon" => Some(AssetClass::Weapon),
+        _ => None,
+    }
+}
+
+impl AssetClass {
+    pub fn name(self) -> &'static str {
+        match self {
+            AssetClass::Hero => "hero",
+            AssetClass::Npc => "npc",
+            AssetClass::Monster => "monster",
+            AssetClass::Prop => "prop",
+            AssetClass::Weapon => "weapon",
+        }
+    }
+
+    /// Characters ship baked normal maps; props and weapons need not.
+    pub fn is_character(self) -> bool {
+        matches!(
+            self,
+            AssetClass::Hero | AssetClass::Npc | AssetClass::Monster
+        )
+    }
+
+    /// Props and weapons are legitimately unrigged; characters must
+    /// carry a skeleton (the rig contract's R_NO_SKIN).
+    pub fn needs_skeleton(self) -> bool {
+        !matches!(self, AssetClass::Prop | AssetClass::Weapon)
+    }
+}
 
 /// Perf budget: every field is a "warn above this" ceiling.
 pub struct Budget {
@@ -38,6 +97,7 @@ pub struct Budget {
     pub max_verts_per_mesh: usize,
     pub max_texture_dim: u32,
     pub max_influences: usize,
+    pub max_bones: usize,
 }
 
 impl Default for Budget {
@@ -48,11 +108,58 @@ impl Default for Budget {
             max_verts_per_mesh: D_MAX_VERTS_PER_MESH,
             max_texture_dim: D_MAX_TEXTURE_DIM,
             max_influences: D_MAX_INFLUENCES,
+            max_bones: D_MAX_BONES,
         }
     }
 }
 
 impl Budget {
+    /// Mobile-profile budget for one asset class: HLL art direction
+    /// (heroes 5k-15k tris, 512-1024 px textures) tightened for
+    /// phone-class GPUs. NPCs wrap the hero base today, so they share
+    /// its bone budget until the lighter mobile rig lands; monsters
+    /// may exceed heroes (one large boss draw, not a crowd); props
+    /// and weapons are small static draws.
+    pub fn mobile_for(class: AssetClass) -> Self {
+        match class {
+            AssetClass::Hero => Budget {
+                max_tris_per_mesh: 15_000,
+                max_verts_per_mesh: 10_000,
+                max_texture_dim: 1024,
+                max_influences: 4,
+                max_bones: 128,
+            },
+            AssetClass::Npc => Budget {
+                max_tris_per_mesh: 8_000,
+                max_verts_per_mesh: 6_000,
+                max_texture_dim: 512,
+                max_influences: 4,
+                max_bones: 128,
+            },
+            AssetClass::Monster => Budget {
+                max_tris_per_mesh: 20_000,
+                max_verts_per_mesh: 12_000,
+                max_texture_dim: 1024,
+                max_influences: 4,
+                max_bones: 128,
+            },
+            AssetClass::Prop => Budget {
+                max_tris_per_mesh: 2_000,
+                max_verts_per_mesh: 1_500,
+                max_texture_dim: 512,
+                max_influences: 4,
+                max_bones: 64,
+            },
+            AssetClass::Weapon => Budget {
+                max_tris_per_mesh: 2_000,
+                max_verts_per_mesh: 1_500,
+                max_texture_dim: 512,
+                max_influences: 4,
+                max_bones: 16,
+            },
+        }
+    }
+
     fn set(&mut self, key: &str, n: u64) -> Result<(), String> {
         match key {
             "max_tris_per_mesh" => {
@@ -71,6 +178,10 @@ impl Budget {
                 self.max_influences =
                     usize::try_from(n).map_err(|_| format!("budget key '{key}': {n} overflows"))?;
             }
+            "max_bones" => {
+                self.max_bones =
+                    usize::try_from(n).map_err(|_| format!("budget key '{key}': {n} overflows"))?;
+            }
             _ => {
                 return Err(format!(
                     "unknown budget key '{key}' (expected {BUDGET_KEYS})"
@@ -81,27 +192,141 @@ impl Budget {
     }
 }
 
-fn parse_json_budget(text: &str) -> Result<Budget, String> {
+/// One budget file: top-level (generic) overrides plus per-class
+/// `[class.X]` overrides. A class resolves each key from its section
+/// first, then the file top level, then its mobile-profile default —
+/// so an old flat file keeps meaning "every asset", and a section
+/// only narrows its own class.
+pub struct BudgetSet {
+    pub generic: Budget,
+    hero: Budget,
+    npc: Budget,
+    monster: Budget,
+    prop: Budget,
+    weapon: Budget,
+}
+
+impl BudgetSet {
+    pub fn mobile() -> Self {
+        BudgetSet {
+            generic: Budget::default(),
+            hero: Budget::mobile_for(AssetClass::Hero),
+            npc: Budget::mobile_for(AssetClass::Npc),
+            monster: Budget::mobile_for(AssetClass::Monster),
+            prop: Budget::mobile_for(AssetClass::Prop),
+            weapon: Budget::mobile_for(AssetClass::Weapon),
+        }
+    }
+
+    pub fn for_class(&self, class: Option<AssetClass>) -> &Budget {
+        match class {
+            None => &self.generic,
+            Some(AssetClass::Hero) => &self.hero,
+            Some(AssetClass::Npc) => &self.npc,
+            Some(AssetClass::Monster) => &self.monster,
+            Some(AssetClass::Prop) => &self.prop,
+            Some(AssetClass::Weapon) => &self.weapon,
+        }
+    }
+
+    fn class_mut(&mut self, class: AssetClass) -> &mut Budget {
+        match class {
+            AssetClass::Hero => &mut self.hero,
+            AssetClass::Npc => &mut self.npc,
+            AssetClass::Monster => &mut self.monster,
+            AssetClass::Prop => &mut self.prop,
+            AssetClass::Weapon => &mut self.weapon,
+        }
+    }
+}
+
+/// Raw overrides from one budget file: top-level (generic) keys
+/// plus per-class section keys, applied by `build` in increasing
+/// specificity (mobile default < top level < class section).
+struct FileBudget {
+    top: Vec<(String, u64)>,
+    sections: Vec<(AssetClass, String, u64)>,
+}
+
+impl FileBudget {
+    fn build(self) -> Result<BudgetSet, String> {
+        let mut set = BudgetSet::mobile();
+        for (k, n) in &self.top {
+            set.generic.set(k, *n)?;
+        }
+        // Top-level keys are the fallback for every class...
+        for c in [
+            AssetClass::Hero,
+            AssetClass::Npc,
+            AssetClass::Monster,
+            AssetClass::Prop,
+            AssetClass::Weapon,
+        ] {
+            for (k, n) in &self.top {
+                set.class_mut(c).set(k, *n)?;
+            }
+        }
+        // ...and a class section narrows only its own class.
+        for (c, k, n) in &self.sections {
+            set.class_mut(*c).set(k, *n)?;
+        }
+        Ok(set)
+    }
+}
+
+fn parse_json_budget(text: &str) -> Result<FileBudget, String> {
     let v: Value =
         serde_json::from_str(text).map_err(|e| format!("budget JSON does not parse: {e}"))?;
     let obj = v
         .as_object()
         .ok_or_else(|| "budget JSON must be an object".to_string())?;
-    let mut b = Budget::default();
+    let mut fb = FileBudget {
+        top: Vec::new(),
+        sections: Vec::new(),
+    };
     for (k, v) in obj {
+        if k == "class" {
+            let classes = v
+                .as_object()
+                .ok_or_else(|| "budget key 'class' must be an object".to_string())?;
+            for (cn, cv) in classes {
+                let class = parse_class(cn).ok_or_else(|| {
+                    format!("unknown asset class '{cn}' (expected {CLASS_NAMES})")
+                })?;
+                let keys = cv
+                    .as_object()
+                    .ok_or_else(|| format!("budget class '{cn}' must be an object"))?;
+                for (kk, vv) in keys {
+                    let n = vv.as_u64().ok_or_else(|| {
+                        format!("budget class '{cn}' key '{kk}': expected a non-negative integer")
+                    })?;
+                    Budget::default()
+                        .set(kk, n)
+                        .map_err(|e| format!("budget class '{cn}': {e}"))?;
+                    fb.sections.push((class, kk.clone(), n));
+                }
+            }
+            continue;
+        }
         let n = v
             .as_u64()
             .ok_or_else(|| format!("budget key '{k}': expected a non-negative integer"))?;
-        b.set(k, n)?;
+        Budget::default().set(k, n)?;
+        fb.top.push((k.clone(), n));
     }
-    Ok(b)
+    Ok(fb)
 }
 
-/// Flat `key = value` subset: blank lines, `#` comments (full-line or
-/// trailing), unsigned integers. No sections, no tables, no strings —
-/// a budget file holds four numbers, and anything else is a typo.
-fn parse_toml_budget(text: &str) -> Result<Budget, String> {
-    let mut b = Budget::default();
+/// Flat `key = value` subset plus `[class.X]` sections: blank lines,
+/// `#` comments (full-line or trailing), unsigned integers. No other
+/// sections, no tables, no strings — a budget file holds numbers, and
+/// anything else is a typo.
+fn parse_toml_budget(text: &str) -> Result<FileBudget, String> {
+    let mut fb = FileBudget {
+        top: Vec::new(),
+        sections: Vec::new(),
+    };
+    let mut section: Option<AssetClass> = None;
     for (ln, raw) in text.lines().enumerate() {
         let tag = format!("budget line {}", ln + 1);
         let line = raw.trim();
@@ -109,9 +334,18 @@ fn parse_toml_budget(text: &str) -> Result<Budget, String> {
             continue;
         }
         if line.starts_with('[') {
-            return Err(format!(
-                "{tag}: [sections] unsupported (flat key = value only)"
-            ));
+            let inner = line
+                .strip_suffix(']')
+                .ok_or_else(|| format!("{tag}: malformed [section] (missing ']')"))?;
+            let inner = inner[1..].trim();
+            let cn = inner.strip_prefix("class.").ok_or_else(|| {
+                format!("{tag}: [{inner}] unsupported (only [class.X], X in {CLASS_NAMES})")
+            })?;
+            let cn = cn.trim();
+            section = Some(parse_class(cn).ok_or_else(|| {
+                format!("{tag}: unknown asset class '{cn}' (expected {CLASS_NAMES})")
+            })?);
+            continue;
         }
         let (k, v) = raw
             .split_once('=')
@@ -129,25 +363,32 @@ fn parse_toml_budget(text: &str) -> Result<Budget, String> {
         let n: u64 = val
             .parse()
             .map_err(|_| format!("{tag}: value for '{key}' overflows"))?;
-        b.set(key, n).map_err(|e| format!("{tag}: {e}"))?;
+        Budget::default()
+            .set(key, n)
+            .map_err(|e| format!("{tag}: {e}"))?;
+        match section {
+            None => fb.top.push((key.to_string(), n)),
+            Some(c) => fb.sections.push((c, key.to_string(), n)),
+        }
     }
-    Ok(b)
+    Ok(fb)
 }
 
 /// Parse budget overrides; format is sniffed from content (a leading
-/// `{` means JSON, anything else the flat TOML subset). Missing keys
-/// keep their mobile defaults.
-pub fn parse_budget(text: &str) -> Result<Budget, String> {
-    if text.trim_start().starts_with('{') {
+/// `{` means JSON, anything else the TOML subset). Missing keys keep
+/// their mobile defaults (generic or per-class).
+pub fn parse_budget_set(text: &str) -> Result<BudgetSet, String> {
+    let fb = if text.trim_start().starts_with('{') {
         parse_json_budget(text)
     } else {
         parse_toml_budget(text)
-    }
+    }?;
+    fb.build()
 }
 
-pub fn load_budget(path: &Path) -> Result<Budget, String> {
+pub fn load_budget_set(path: &Path) -> Result<BudgetSet, String> {
     let text = fs::read_to_string(path).map_err(|e| format!("cannot read budget file: {e}"))?;
-    parse_budget(&text)
+    parse_budget_set(&text)
 }
 
 fn arr<'a>(v: &'a Value, key: &str) -> &'a [Value] {
@@ -192,6 +433,24 @@ fn img_tag(images: &[Value], ii: usize) -> String {
     {
         Some(n) if !n.is_empty() => format!("image {ii} '{n}'"),
         _ => format!("image {ii}"),
+    }
+}
+
+/// "hero " for classed runs, "" unclassed: classed warns name the
+/// class whose budget fired ("exceed 15000 hero budget").
+fn class_tag(class: Option<AssetClass>) -> String {
+    match class {
+        Some(c) => format!("{} ", c.name()),
+        None => String::new(),
+    }
+}
+
+fn join_names(names: &[String]) -> String {
+    const CAP: usize = 5;
+    if names.len() <= CAP {
+        names.join(", ")
+    } else {
+        format!("{} (+{} more)", names[..CAP].join(", "), names.len() - CAP)
     }
 }
 
@@ -289,7 +548,12 @@ fn image_bytes<'a>(json: &Value, bin: &'a [u8], bvi: usize) -> Option<&'a [u8]> 
 /// are unreadable are excluded from both — but a mesh still warns
 /// when its known counts alone exceed the budget, since unknown
 /// prims can only add (the `+N uncounted` note says so).
-fn check_meshes(json: &Value, b: &Budget, out: &mut Vec<(&'static str, String)>) {
+fn check_meshes(
+    json: &Value,
+    b: &Budget,
+    class: Option<AssetClass>,
+    out: &mut Vec<(&'static str, String)>,
+) {
     for (mi, mesh) in arr(json, "meshes").iter().enumerate() {
         let mtag = mesh_tag(arr(json, "meshes"), mi);
         let mut verts = 0usize;
@@ -333,8 +597,9 @@ fn check_meshes(json: &Value, b: &Budget, out: &mut Vec<(&'static str, String)>)
             out.push((
                 "P_VERTS",
                 format!(
-                    "{mtag}: {verts} verts exceed {} budget{}",
+                    "{mtag}: {verts} verts exceed {} {}budget{}",
                     b.max_verts_per_mesh,
+                    class_tag(class),
                     note(v_unknown),
                 ),
             ));
@@ -343,8 +608,9 @@ fn check_meshes(json: &Value, b: &Budget, out: &mut Vec<(&'static str, String)>)
             out.push((
                 "P_TRIS",
                 format!(
-                    "{mtag}: {tris} tris exceed {} budget{}",
+                    "{mtag}: {tris} tris exceed {} {}budget{}",
                     b.max_tris_per_mesh,
+                    class_tag(class),
                     note(t_unknown),
                 ),
             ));
@@ -354,7 +620,13 @@ fn check_meshes(json: &Value, b: &Budget, out: &mut Vec<(&'static str, String)>)
 
 /// Embedded (bufferView) texture dims; external/data URIs and foreign
 /// codecs are skipped silently (unmeasured, not over-budget).
-fn check_textures(json: &Value, bin: &[u8], b: &Budget, out: &mut Vec<(&'static str, String)>) {
+fn check_textures(
+    json: &Value,
+    bin: &[u8],
+    b: &Budget,
+    class: Option<AssetClass>,
+    out: &mut Vec<(&'static str, String)>,
+) {
     let images = arr(json, "images");
     for (ii, im) in images.iter().enumerate() {
         let bytes = match im.get("bufferView").and_then(as_idx) {
@@ -376,12 +648,179 @@ fn check_textures(json: &Value, bin: &[u8], b: &Budget, out: &mut Vec<(&'static 
             out.push((
                 "P_TEX_SIZE",
                 format!(
-                    "{}: {w}x{h} exceeds {}px budget",
+                    "{}: {w}x{h} exceeds {}px {}budget",
                     img_tag(images, ii),
                     b.max_texture_dim,
+                    class_tag(class),
                 ),
             ));
         }
+    }
+}
+
+/// Unique DEF-* joint nodes across all skins: the deform-bone
+/// count the skinning palette must upload. Non-DEF joints and
+/// dangling refs are the contract layer's business (R_*), not the
+/// budget's.
+fn deform_bone_count(json: &Value) -> usize {
+    let nodes = arr(json, "nodes");
+    let mut seen: BTreeSet<usize> = BTreeSet::new();
+    for skin in arr(json, "skins") {
+        for j in arr(skin, "joints") {
+            let idx = j.as_u64().and_then(|n| usize::try_from(n).ok());
+            let is_def = idx.is_some_and(|i| {
+                nodes
+                    .get(i)
+                    .and_then(|n| n.get("name"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|n| n.starts_with("DEF-"))
+            });
+            if is_def {
+                seen.insert(idx.unwrap_or(usize::MAX));
+            }
+        }
+    }
+    seen.len()
+}
+
+fn check_bones(
+    json: &Value,
+    b: &Budget,
+    class: Option<AssetClass>,
+    out: &mut Vec<(&'static str, String)>,
+) {
+    let n = deform_bone_count(json);
+    if n > b.max_bones {
+        out.push((
+            "P_BONES",
+            format!(
+                "{n} deform bone{} exceed{} {} {}budget",
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "s" } else { "" },
+                b.max_bones,
+                class_tag(class),
+            ),
+        ));
+    }
+}
+
+/// Characters ship baked normal maps (AI color/detail is baked onto
+/// the low-poly); a character class with no material carrying
+/// `normalTexture` warns. Props and weapons need none, and unclassed
+/// runs cannot know the file is a character, so both skip.
+fn check_normal_map(
+    json: &Value,
+    class: Option<AssetClass>,
+    out: &mut Vec<(&'static str, String)>,
+) {
+    let Some(c) = class else { return };
+    if !c.is_character() {
+        return;
+    }
+    let has_normal = arr(json, "materials")
+        .iter()
+        .any(|m| m.get("normalTexture").is_some());
+    if !has_normal {
+        out.push((
+            "P_TEX_NORMAL",
+            format!(
+                "no material with normalTexture ({} needs a baked normal map)",
+                c.name(),
+            ),
+        ));
+    }
+}
+
+/// Detachable pieces (capes, hair) are remeshed separately and get
+/// body weights via Data Transfer, so every bone a piece mesh uses
+/// must also carry body weight. Detection is by mesh name
+/// (case-insensitive); body is the union of nonzero-weight joints
+/// over all other skinned meshes. Piece-only files, unskinned
+/// pieces, and unreadable weights skip silently (nothing provable;
+/// the weight layer owns malformed reads).
+const PIECE_WORDS: &[&str] = &["cape", "cloak", "hair", "ponytail", "braid"];
+
+fn is_piece_mesh(mesh: &Value) -> bool {
+    let name = mesh.get("name").and_then(Value::as_str).unwrap_or("");
+    let lower = name.to_lowercase();
+    PIECE_WORDS.iter().any(|w| lower.contains(w))
+}
+
+fn check_pieces(json: &Value, bin: &[u8], out: &mut Vec<(&'static str, String)>) {
+    let meshes = arr(json, "meshes");
+    let mut body: BTreeSet<usize> = BTreeSet::new();
+    let mut pieces: Vec<(usize, BTreeSet<usize>)> = Vec::new();
+    for (mi, mesh) in meshes.iter().enumerate() {
+        let used = match crate::weights::used_nodes(json, bin, mi) {
+            Some(u) => u,
+            None => continue,
+        };
+        if is_piece_mesh(mesh) {
+            pieces.push((mi, used));
+        } else {
+            body.extend(used);
+        }
+    }
+    if pieces.is_empty() || body.is_empty() {
+        return;
+    }
+    let nodes = arr(json, "nodes");
+    for (mi, used) in pieces {
+        let mut bad: Vec<String> = used
+            .difference(&body)
+            .filter_map(|n| {
+                nodes
+                    .get(*n)
+                    .and_then(|x| x.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        bad.sort();
+        bad.dedup();
+        if !bad.is_empty() {
+            out.push((
+                "P_PIECE_BONES",
+                format!(
+                    "{}: skinned to {} non-body bone{}: {}",
+                    mesh_tag(meshes, mi),
+                    bad.len(),
+                    if bad.len() == 1 { "" } else { "s" },
+                    join_names(&bad),
+                ),
+            ));
+        }
+    }
+}
+
+/// Weapons attach to the hand bone in Godot (`BoneAttachment3D`):
+/// the file carries no skin, and a node named `ATTACH-*` marks the
+/// grip point the importer snaps to the hand. Class-gated: only a
+/// `--class weapon` run knows the file is a weapon.
+fn check_weapon(json: &Value, class: Option<AssetClass>, out: &mut Vec<(&'static str, String)>) {
+    if class != Some(AssetClass::Weapon) {
+        return;
+    }
+    let n = arr(json, "skins").len();
+    if n > 0 {
+        out.push((
+            "P_WEAPON_SKIN",
+            format!(
+                "{n} skin{} (weapons attach, never skin)",
+                if n == 1 { "" } else { "s" },
+            ),
+        ));
+    }
+    let has_attach = arr(json, "nodes").iter().any(|nd| {
+        nd.get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|nm| nm.starts_with("ATTACH-"))
+    });
+    if !has_attach {
+        out.push((
+            "P_WEAPON_ATTACH",
+            "no ATTACH-* node (weapons need a named grip point)".to_string(),
+        ));
     }
 }
 
@@ -389,20 +828,26 @@ pub fn check_budgets(
     json: &Value,
     bin: &[u8],
     budget: &Budget,
+    class: Option<AssetClass>,
     skin: &SkinStats,
 ) -> Vec<(&'static str, String)> {
     let mut out: Vec<(&'static str, String)> = Vec::new();
-    check_meshes(json, budget, &mut out);
-    check_textures(json, bin, budget, &mut out);
+    check_meshes(json, budget, class, &mut out);
+    check_textures(json, bin, budget, class, &mut out);
+    check_bones(json, budget, class, &mut out);
+    check_normal_map(json, class, &mut out);
+    check_pieces(json, bin, &mut out);
+    check_weapon(json, class, &mut out);
     // Reuses the weight layer's stats: prims it could not read (sparse,
     // malformed) contribute nothing here either.
     if skin.checked_prims > 0 && skin.max_influences > budget.max_influences {
         out.push((
             "P_INFLUENCES",
             format!(
-                "max {} infl/vert exceeds {} budget (across {} checked prim{})",
+                "max {} infl/vert exceeds {} {}budget (across {} checked prim{})",
                 skin.max_influences,
                 budget.max_influences,
+                class_tag(class),
                 skin.checked_prims,
                 if skin.checked_prims == 1 { "" } else { "s" },
             ),
@@ -415,6 +860,12 @@ pub fn check_budgets(
 mod tests {
     use super::*;
 
+    /// Generic budget from a budget file: class sections parse but
+    /// are dropped here (class tests use `parse_budget_set`).
+    fn parse_budget(text: &str) -> Result<Budget, String> {
+        Ok(parse_budget_set(text)?.generic)
+    }
+
     #[test]
     fn defaults_match_readme() {
         let b = Budget::default();
@@ -422,6 +873,7 @@ mod tests {
         assert_eq!(b.max_verts_per_mesh, 65_535);
         assert_eq!(b.max_texture_dim, 2048);
         assert_eq!(b.max_influences, 4);
+        assert_eq!(b.max_bones, 256);
     }
 
     #[test]
@@ -525,5 +977,127 @@ mod tests {
         assert_eq!(png_dims(&png(0, 64)), None);
         assert_eq!(sane_dims(65536, 65536), Some((65536, 65536)));
         assert_eq!(sane_dims(65537, 8), None);
+    }
+
+    #[test]
+    fn classes_parse_and_group() {
+        use AssetClass::*;
+        assert_eq!(parse_class("hero"), Some(Hero));
+        assert_eq!(parse_class("npc"), Some(Npc));
+        assert_eq!(parse_class("monster"), Some(Monster));
+        assert_eq!(parse_class("prop"), Some(Prop));
+        assert_eq!(parse_class("weapon"), Some(Weapon));
+        assert_eq!(parse_class("boss"), None);
+        assert_eq!(parse_class("Hero"), None);
+        assert_eq!(parse_class(""), None);
+        assert!(Hero.is_character() && Npc.is_character() && Monster.is_character());
+        assert!(!Prop.is_character() && !Weapon.is_character());
+        assert!(Hero.needs_skeleton() && Npc.needs_skeleton() && Monster.needs_skeleton());
+        assert!(!Prop.needs_skeleton() && !Weapon.needs_skeleton());
+    }
+
+    fn ceilings(b: &Budget) -> (usize, usize, u32, usize, usize) {
+        (
+            b.max_tris_per_mesh,
+            b.max_verts_per_mesh,
+            b.max_texture_dim,
+            b.max_influences,
+            b.max_bones,
+        )
+    }
+
+    #[test]
+    fn mobile_class_defaults_match_readme() {
+        use AssetClass::*;
+        assert_eq!(
+            ceilings(&Budget::mobile_for(Hero)),
+            (15_000, 10_000, 1024, 4, 128)
+        );
+        assert_eq!(
+            ceilings(&Budget::mobile_for(Npc)),
+            (8_000, 6_000, 512, 4, 128)
+        );
+        assert_eq!(
+            ceilings(&Budget::mobile_for(Monster)),
+            (20_000, 12_000, 1024, 4, 128)
+        );
+        assert_eq!(
+            ceilings(&Budget::mobile_for(Prop)),
+            (2_000, 1_500, 512, 4, 64)
+        );
+        assert_eq!(
+            ceilings(&Budget::mobile_for(Weapon)),
+            (2_000, 1_500, 512, 4, 16)
+        );
+    }
+
+    #[test]
+    fn toml_class_sections_fall_back() {
+        use AssetClass::*;
+        let set = parse_budget_set(
+            "max_tris_per_mesh = 50000\n\
+             [class.hero]\n\
+             max_tris_per_mesh = 15000\n\
+             max_bones = 100\n",
+        )
+        .unwrap();
+        // Generic sees only the top level.
+        assert_eq!(set.generic.max_tris_per_mesh, 50_000);
+        assert_eq!(set.generic.max_bones, D_MAX_BONES);
+        // Section narrows its own class...
+        let hero = set.for_class(Some(Hero));
+        assert_eq!(hero.max_tris_per_mesh, 15_000);
+        assert_eq!(hero.max_bones, 100);
+        assert_eq!(hero.max_texture_dim, 1024);
+        // Other classes fall back to the top level, then their
+        // mobile defaults; hero keeps its own mobile default above.
+        let npc = set.for_class(Some(Npc));
+        assert_eq!(npc.max_tris_per_mesh, 50_000);
+        assert_eq!(npc.max_bones, 128);
+        assert_eq!(npc.max_texture_dim, 512);
+        assert!(set.for_class(None).max_tris_per_mesh == 50_000);
+    }
+
+    #[test]
+    fn toml_class_rejects_garbage() {
+        assert!(parse_budget_set("[class.boss]\nmax_tris_per_mesh = 5").is_err());
+        assert!(parse_budget_set("[budget]\nmax_tris_per_mesh = 5").is_err());
+        assert!(parse_budget_set("[class.hero\nmax_tris_per_mesh = 5").is_err());
+        assert!(parse_budget_set("[class.hero]\nmax_tris = 5").is_err());
+        assert!(parse_budget_set("[class.hero]\nmax_bones = lots").is_err());
+        assert!(parse_budget_set("[class.]\nmax_bones = 5").is_err());
+        // Sections do not leak into the generic budget.
+        let set = parse_budget_set("[class.hero]\nmax_bones = 100\n").unwrap();
+        assert_eq!(set.generic.max_bones, D_MAX_BONES);
+        assert_eq!(set.for_class(Some(AssetClass::Hero)).max_bones, 100);
+    }
+
+    #[test]
+    fn json_class_nesting_falls_back() {
+        use AssetClass::*;
+        let set = parse_budget_set(
+            r#"{"max_texture_dim": 1024,
+                "class": {"prop": {"max_tris_per_mesh": 1000},
+                          "hero": {"max_bones": 100}}}"#,
+        )
+        .unwrap();
+        assert_eq!(set.generic.max_texture_dim, 1024);
+        assert_eq!(set.generic.max_tris_per_mesh, D_MAX_TRIS_PER_MESH);
+        let prop = set.for_class(Some(Prop));
+        assert_eq!(prop.max_tris_per_mesh, 1_000);
+        assert_eq!(prop.max_texture_dim, 1024); // top-level fallback
+        let hero = set.for_class(Some(Hero));
+        assert_eq!(hero.max_bones, 100);
+        assert_eq!(hero.max_texture_dim, 1024); // top-level beats class default
+        assert_eq!(hero.max_tris_per_mesh, 15_000); // hero default kept
+    }
+
+    #[test]
+    fn json_class_rejects_garbage() {
+        assert!(parse_budget_set(r#"{"class": {"boss": {}}}"#).is_err());
+        assert!(parse_budget_set(r#"{"class": {"hero": {"max_tris": 1}}}"#).is_err());
+        assert!(parse_budget_set(r#"{"class": 5}"#).is_err());
+        assert!(parse_budget_set(r#"{"class": {"hero": 5}}"#).is_err());
+        assert!(parse_budget_set(r#"{"class": {"hero": {"max_bones": -1}}}"#).is_err());
     }
 }

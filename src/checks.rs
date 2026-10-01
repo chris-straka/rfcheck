@@ -18,6 +18,9 @@ pub struct Report {
     /// which case the report (and its JSON shape) is exactly v0.3.0.
     pub warns: Option<Vec<Diag>>,
     pub summary: String,
+    /// Asset class the file was checked as (`--class`). None for
+    /// unclassed runs, whose output is unchanged.
+    pub class: Option<budget::AssetClass>,
 }
 
 impl Report {
@@ -40,6 +43,11 @@ impl Report {
         map.insert("ok".to_string(), json!(!self.failed()));
         map.insert("summary".to_string(), json!(self.summary));
         map.insert("diags".to_string(), Value::Array(diags));
+        // No "class" key unless --class was given: unclassed runs keep
+        // their exact JSON shape.
+        if let Some(c) = self.class {
+            map.insert("class".to_string(), json!(c.name()));
+        }
         // No "warns" key at all unless budgets ran: plain runs keep the
         // v0.3.0 JSON shape byte-for-byte.
         if let Some(warns) = &self.warns {
@@ -81,6 +89,14 @@ pub fn check_glb(bytes: &[u8]) -> Report {
 }
 
 pub fn check_glb_with_budget(bytes: &[u8], budget: Option<&budget::Budget>) -> Report {
+    check_glb_with_class(bytes, budget, None)
+}
+
+pub fn check_glb_with_class(
+    bytes: &[u8],
+    budget: Option<&budget::Budget>,
+    class: Option<budget::AssetClass>,
+) -> Report {
     let doc = match glb::parse(bytes) {
         Ok(d) => d,
         Err((code, detail)) => {
@@ -88,6 +104,7 @@ pub fn check_glb_with_budget(bytes: &[u8], budget: Option<&budget::Budget>) -> R
                 diags: vec![Diag { code, detail }],
                 warns: None,
                 summary: "invalid container".to_string(),
+                class,
             };
         }
     };
@@ -99,7 +116,12 @@ pub fn check_glb_with_budget(bytes: &[u8], budget: Option<&budget::Budget>) -> R
 
     let mut diags: Vec<Diag> = Vec::new();
 
-    if skins.is_empty() {
+    // Props and weapons are legitimately unrigged: without a skeleton
+    // there is nothing to require and no DEF rule to check anims
+    // against. Rigged props still face the full contract below.
+    let relaxed = skins.is_empty() && class.is_some_and(|c| !c.needs_skeleton());
+
+    if skins.is_empty() && !relaxed {
         diags.push(Diag {
             code: "R_NO_SKIN",
             detail: "no skins: rig GLB must contain a skeleton".to_string(),
@@ -144,28 +166,30 @@ pub fn check_glb_with_budget(bytes: &[u8], budget: Option<&budget::Budget>) -> R
         });
     }
 
-    for (ci, clip) in clips.iter().enumerate() {
-        let mut bad: Vec<String> = Vec::new();
-        for ch in arr(clip, "channels") {
-            let target = ch.get("target").and_then(|t| t.get("node"));
-            let name = target
-                .and_then(|v| v.as_u64())
-                .and_then(|v| usize::try_from(v).ok())
-                .and_then(|i| node_name(nodes, i))
-                .map(str::to_string);
-            match name {
-                Some(n) if n.starts_with("DEF-") => {}
-                Some(n) => bad.push(n),
-                None => bad.push("<missing node>".to_string()),
+    if !relaxed {
+        for (ci, clip) in clips.iter().enumerate() {
+            let mut bad: Vec<String> = Vec::new();
+            for ch in arr(clip, "channels") {
+                let target = ch.get("target").and_then(|t| t.get("node"));
+                let name = target
+                    .and_then(|v| v.as_u64())
+                    .and_then(|v| usize::try_from(v).ok())
+                    .and_then(|i| node_name(nodes, i))
+                    .map(str::to_string);
+                match name {
+                    Some(n) if n.starts_with("DEF-") => {}
+                    Some(n) => bad.push(n),
+                    None => bad.push("<missing node>".to_string()),
+                }
             }
-        }
-        bad.sort();
-        bad.dedup();
-        if !bad.is_empty() {
-            diags.push(Diag {
-                code: "R_ANIM_TARGET",
-                detail: format!("clip {ci} targets non-DEF nodes: {}", join_names(&bad)),
-            });
+            bad.sort();
+            bad.dedup();
+            if !bad.is_empty() {
+                diags.push(Diag {
+                    code: "R_ANIM_TARGET",
+                    detail: format!("clip {ci} targets non-DEF nodes: {}", join_names(&bad)),
+                });
+            }
         }
     }
 
@@ -179,7 +203,7 @@ pub fn check_glb_with_budget(bytes: &[u8], budget: Option<&budget::Budget>) -> R
     }
 
     let warns: Option<Vec<Diag>> = budget.map(|b| {
-        budget::check_budgets(json, doc.bin, b, &skin)
+        budget::check_budgets(json, doc.bin, b, class, &skin)
             .into_iter()
             .map(|(code, detail)| Diag { code, detail })
             .collect()
@@ -194,6 +218,9 @@ pub fn check_glb_with_budget(bytes: &[u8], budget: Option<&budget::Budget>) -> R
         clips.len(),
         if clips.len() == 1 { "" } else { "s" },
     );
+    if let Some(c) = class {
+        summary.push_str(&format!(", class {}", c.name()));
+    }
     if skin.checked_prims > 0 {
         summary.push_str(&format!(", max {} infl/vert", skin.max_influences));
     }
@@ -206,6 +233,7 @@ pub fn check_glb_with_budget(bytes: &[u8], budget: Option<&budget::Budget>) -> R
         diags,
         warns,
         summary,
+        class,
     }
 }
 
@@ -874,6 +902,10 @@ mod tests {
             .map(|d| d.detail.as_str())
     }
 
+    fn file_budget(text: &str) -> budget::Budget {
+        budget::parse_budget_set(text).unwrap().generic
+    }
+
     fn mesh_budget_doc(verts: u64, idx: u64) -> (Value, Vec<u8>) {
         // POSITION bytes + U16 index bytes, sized so X_ACCESSOR_BOUNDS
         // stays quiet: budget tests must isolate the P_* layer.
@@ -978,14 +1010,12 @@ mod tests {
     #[test]
     fn mobile_custom_budget_overrides() {
         let (sdoc, sbin) = mesh_budget_doc(1_000, 3_000);
-        let tight = budget::parse_budget(r#"{"max_verts_per_mesh": 500}"#).unwrap();
+        let tight = file_budget(r#"{"max_verts_per_mesh": 500}"#);
         let r = check_glb_with_budget(&pack_bin(&sdoc, &sbin), Some(&tight));
         assert!(r.diags.is_empty());
         assert_eq!(wcodes(&r), vec!["P_VERTS"]); // tris still under default
         let (bdoc, bbin) = mesh_budget_doc(70_000, 300_000);
-        let loose =
-            budget::parse_budget("max_verts_per_mesh = 999999\nmax_tris_per_mesh = 999999\n")
-                .unwrap();
+        let loose = file_budget("max_verts_per_mesh = 999999\nmax_tris_per_mesh = 999999\n");
         let r = check_glb_with_budget(&pack_bin(&bdoc, &bbin), Some(&loose));
         assert!(r.diags.is_empty());
         assert!(r.warnings().is_empty(), "loose budget must pass");
@@ -1014,7 +1044,7 @@ mod tests {
         assert_eq!(base.summary, "4 joints, 1 mesh, 0 clips, max 4 infl/vert");
         // Default mobile budget agrees (4 is the phone standard); a
         // low-end override warns while the contract still passes.
-        let strict = budget::parse_budget(r#"{"max_influences": 2}"#).unwrap();
+        let strict = file_budget(r#"{"max_influences": 2}"#);
         let r = check_glb_with_budget(&bytes, Some(&strict));
         assert!(
             r.diags.is_empty(),
@@ -1065,6 +1095,283 @@ mod tests {
         let r = check_glb_with_budget(&pack_bin(&doc, &small), Some(&budget::Budget::default()));
         assert!(r.diags.is_empty(), "unexpected: {:?}", diags_str(&r));
         assert!(r.warnings().is_empty());
+    }
+
+    fn classed(bytes: &[u8], class: budget::AssetClass) -> Report {
+        let b = budget::Budget::mobile_for(class);
+        check_glb_with_class(bytes, Some(&b), Some(class))
+    }
+
+    fn joints_doc(def: usize, other: usize) -> Value {
+        let mut nodes = Vec::new();
+        let mut joints = Vec::new();
+        for i in 0..def {
+            nodes.push(json!({"name": format!("DEF-b{i}")}));
+            joints.push(json!(i));
+        }
+        for i in 0..other {
+            nodes.push(json!({"name": format!("ctrl{i}")}));
+            joints.push(json!(def + i));
+        }
+        json!({
+            "nodes": nodes,
+            "skins": [{"joints": joints}],
+            "materials": [{"normalTexture": {"index": 0}}],
+        })
+    }
+
+    #[test]
+    fn class_hero_mesh_budget_names_class() {
+        use budget::AssetClass::Hero;
+        // Over both hero ceilings (15k tris, 10k verts), under the
+        // generic flagship ones: only a classed run warns.
+        let (mut doc, bin) = mesh_budget_doc(12_000, 48_000);
+        // A normal map, so the test isolates mesh budgets (heroes
+        // without one earn P_TEX_NORMAL, covered separately).
+        doc["materials"] = json!([{"normalTexture": {"index": 0}}]);
+        let bytes = pack_bin(&doc, &bin);
+        let r = classed(&bytes, Hero);
+        assert!(r.diags.is_empty(), "must not fail: {:?}", diags_str(&r));
+        assert_eq!(wcodes(&r), vec!["P_VERTS", "P_TRIS"]);
+        let v = warn_for(&r, "P_VERTS").unwrap();
+        assert!(v.contains("12000 verts"), "no count: {v}");
+        assert!(v.contains("10000 hero budget"), "no class budget: {v}");
+        let t = warn_for(&r, "P_TRIS").unwrap();
+        assert!(t.contains("16000 tris"), "no count: {t}");
+        assert!(t.contains("15000 hero budget"), "no class budget: {t}");
+        assert!(r.summary.contains("class hero"), "summary: {}", r.summary);
+        let j: Value = serde_json::from_str(&r.to_json(Path::new("hero.glb"))).unwrap();
+        assert_eq!(j["class"], json!("hero"));
+        assert_eq!(j["ok"], json!(true));
+        // Same file, unclassed mobile run: flagship ceilings pass.
+        let r = check_glb_with_budget(&bytes, Some(&budget::Budget::default()));
+        assert!(r.warnings().is_empty(), "generic must pass");
+        assert!(r.to_json(Path::new("hero.glb")).find("\"class\"").is_none());
+    }
+
+    #[test]
+    fn class_top_level_fallback_applies() {
+        use budget::AssetClass::Hero;
+        // Old flat file means "every asset", classed runs included.
+        let set = budget::parse_budget_set("max_tris_per_mesh = 50000\n").unwrap();
+        let (mut doc, bin) = mesh_budget_doc(1_000, 180_000); // 60k tris
+        doc["materials"] = json!([{"normalTexture": {"index": 0}}]);
+        let r = check_glb_with_class(
+            &pack_bin(&doc, &bin),
+            Some(set.for_class(Some(Hero))),
+            Some(Hero),
+        );
+        assert!(r.diags.is_empty());
+        assert_eq!(wcodes(&r), vec!["P_TRIS"]);
+        let t = warn_for(&r, "P_TRIS").unwrap();
+        assert!(t.contains("50000 hero budget"), "no fallback: {t}");
+    }
+
+    #[test]
+    fn class_bones_count_def_only() {
+        use budget::AssetClass::Hero;
+        // 130 deform bones over the 128 hero ceiling; 5 control
+        // joints fail the contract but do not join the bone count.
+        let r = classed(&pack(&joints_doc(130, 5)), Hero);
+        assert!(codes(&r).contains(&"R_JOINT_PREFIX"));
+        let d = warn_for(&r, "P_BONES").expect("missing P_BONES");
+        assert!(d.contains("130 deform bones"), "no count: {d}");
+        assert!(d.contains("128 hero budget"), "no budget: {d}");
+        // The R_* fails; the P_* only warns.
+        assert!(r.failed());
+        // Small rig under every ceiling stays silent.
+        let r = classed(&pack(&joints_doc(4, 0)), Hero);
+        assert!(r.diags.is_empty(), "unexpected: {:?}", diags_str(&r));
+        assert!(r.warnings().is_empty(), "unexpected warns");
+        // Unclassed default (256) tolerates mid-size rigs.
+        let r = check_glb_with_budget(&pack(&joints_doc(200, 0)), Some(&budget::Budget::default()));
+        assert!(warn_for(&r, "P_BONES").is_none());
+        let tight = file_budget("max_bones = 100\n");
+        let r = check_glb_with_budget(&pack(&joints_doc(200, 0)), Some(&tight));
+        let d = warn_for(&r, "P_BONES").expect("missing P_BONES");
+        assert!(
+            d.contains("200 deform bones exceed 100 budget"),
+            "detail: {d}"
+        );
+    }
+
+    #[test]
+    fn class_normal_map_characters_only() {
+        use budget::AssetClass::*;
+        let bare = json!({
+            "nodes": [{"name": "DEF-a"}],
+            "skins": [{"joints": [0]}],
+        });
+        let r = classed(&pack(&bare), Hero);
+        let d = warn_for(&r, "P_TEX_NORMAL").expect("hero needs P_TEX_NORMAL");
+        assert!(d.contains("normalTexture"), "detail: {d}");
+        assert!(r.diags.is_empty(), "warn only: {:?}", diags_str(&r));
+        let r = classed(&pack(&bare), Npc);
+        assert!(warn_for(&r, "P_TEX_NORMAL").is_some());
+        // Props, weapons, and unclassed runs skip (nothing provable).
+        let r = classed(&pack(&bare), Prop);
+        assert!(warn_for(&r, "P_TEX_NORMAL").is_none());
+        let r = classed(&pack(&bare), Weapon);
+        assert!(warn_for(&r, "P_TEX_NORMAL").is_none());
+        let r = check_glb_with_budget(&pack(&bare), Some(&budget::Budget::default()));
+        assert!(warn_for(&r, "P_TEX_NORMAL").is_none());
+        // Any material with a normalTexture satisfies the check.
+        let mut with_normal = bare.clone();
+        with_normal["materials"] = json!([
+            {"name": "skin"},
+            {"name": "cloth", "normalTexture": {"index": 0}},
+        ]);
+        let r = classed(&pack(&with_normal), Hero);
+        assert!(warn_for(&r, "P_TEX_NORMAL").is_none());
+    }
+
+    fn piece_doc() -> Value {
+        json!({
+            "nodes": [
+                {"name": "DEF-a"}, {"name": "DEF-b"},
+                {"name": "DEF-c"}, {"name": "DEF-d"},
+                {"name": "Body", "mesh": 0, "skin": 0},
+                {"name": "Cape", "mesh": 1, "skin": 0},
+            ],
+            "meshes": [
+                {"name": "Body",
+                 "primitives": [{"attributes": {"JOINTS_0": 0, "WEIGHTS_0": 1}}]},
+                {"name": "Cape",
+                 "primitives": [{"attributes": {"JOINTS_0": 2, "WEIGHTS_0": 3}}]},
+            ],
+            "skins": [{"joints": [0, 1, 2, 3]}],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5121, "type": "VEC4", "count": 1},
+                {"bufferView": 1, "componentType": 5126, "type": "VEC4", "count": 1},
+                {"bufferView": 2, "componentType": 5121, "type": "VEC4", "count": 1},
+                {"bufferView": 3, "componentType": 5126, "type": "VEC4", "count": 1},
+            ],
+            "bufferViews": [
+                {"byteOffset": 0, "byteLength": 4},
+                {"byteOffset": 4, "byteLength": 16},
+                {"byteOffset": 20, "byteLength": 4},
+                {"byteOffset": 24, "byteLength": 16},
+            ],
+            "buffers": [{"byteLength": 40}],
+        })
+    }
+
+    fn piece_bin(cape_joint: u8) -> Vec<u8> {
+        let mut bin = vec![0, 1, 0, 0]; // body: joints 0+1
+        bin.extend_from_slice(&f32s(&[0.5, 0.5, 0.0, 0.0]));
+        bin.extend_from_slice(&[cape_joint, 0, 0, 0]); // cape: one joint
+        bin.extend_from_slice(&f32s(&[1.0, 0.0, 0.0, 0.0]));
+        bin
+    }
+
+    #[test]
+    fn class_piece_bones_subset_of_body() {
+        use budget::AssetClass::Hero;
+        // Cape on a body bone: clean.
+        let r = classed(&pack_bin(&piece_doc(), &piece_bin(1)), Hero);
+        assert!(r.diags.is_empty(), "unexpected: {:?}", diags_str(&r));
+        assert!(
+            warn_for(&r, "P_PIECE_BONES").is_none(),
+            "body-only cape must pass"
+        );
+        // Cape on DEF-d, which carries no body weight: warn, name it.
+        let r = classed(&pack_bin(&piece_doc(), &piece_bin(3)), Hero);
+        assert!(r.diags.is_empty(), "weights are valid: {:?}", diags_str(&r));
+        let d = warn_for(&r, "P_PIECE_BONES").expect("missing P_PIECE_BONES");
+        assert!(d.contains("Cape"), "no mesh: {d}");
+        assert!(d.contains("1 non-body bone"), "no count: {d}");
+        assert!(d.contains("DEF-d"), "no bone name: {d}");
+    }
+
+    #[test]
+    fn class_piece_without_body_skips() {
+        use budget::AssetClass::Hero;
+        // A lone cape file has no body to compare against: silent.
+        let doc = json!({
+            "nodes": [{"name": "DEF-a"}, {"name": "Cape", "mesh": 0, "skin": 0}],
+            "meshes": [{"name": "Cape",
+                        "primitives": [{"attributes": {"JOINTS_0": 0, "WEIGHTS_0": 1}}]}],
+            "skins": [{"joints": [0]}],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5121, "type": "VEC4", "count": 1},
+                {"bufferView": 1, "componentType": 5126, "type": "VEC4", "count": 1},
+            ],
+            "bufferViews": [
+                {"byteOffset": 0, "byteLength": 4},
+                {"byteOffset": 4, "byteLength": 16},
+            ],
+            "buffers": [{"byteLength": 20}],
+        });
+        let mut bin = vec![0, 0, 0, 0];
+        bin.extend_from_slice(&f32s(&[1.0, 0.0, 0.0, 0.0]));
+        let r = classed(&pack_bin(&doc, &bin), Hero);
+        assert!(r.diags.is_empty(), "unexpected: {:?}", diags_str(&r));
+        assert!(warn_for(&r, "P_PIECE_BONES").is_none());
+    }
+
+    #[test]
+    fn class_weapon_shape() {
+        use budget::AssetClass::Weapon;
+        let sword = json!({
+            "nodes": [{"name": "Sword", "mesh": 0}, {"name": "ATTACH-Grip"}],
+            "meshes": [{"name": "Sword", "primitives": [{}]}],
+        });
+        // Unrigged + grip point: the correct weapon shape, fully clean.
+        let r = classed(&pack(&sword), Weapon);
+        assert!(
+            r.diags.is_empty(),
+            "weapon may be unrigged: {:?}",
+            diags_str(&r)
+        );
+        assert!(r.warnings().is_empty(), "clean weapon warns nothing");
+        assert_eq!(r.summary, "0 joints, 1 mesh, 0 clips, class weapon");
+        // A skin on a weapon warns (and the non-DEF joint fails).
+        let mut skinned = sword.clone();
+        skinned["skins"] = json!([{"joints": [0]}]);
+        let r = classed(&pack(&skinned), Weapon);
+        assert!(codes(&r).contains(&"R_JOINT_PREFIX"));
+        let d = warn_for(&r, "P_WEAPON_SKIN").expect("missing P_WEAPON_SKIN");
+        assert!(d.contains("1 skin"), "no count: {d}");
+        // No grip point warns.
+        let mut gripless = sword.clone();
+        gripless["nodes"] = json!([{"name": "Sword", "mesh": 0}]);
+        let r = classed(&pack(&gripless), Weapon);
+        assert!(
+            r.diags.is_empty(),
+            "still unrigged-clean: {:?}",
+            diags_str(&r)
+        );
+        let d = warn_for(&r, "P_WEAPON_ATTACH").expect("missing P_WEAPON_ATTACH");
+        assert!(d.contains("ATTACH-*"), "detail: {d}");
+    }
+
+    #[test]
+    fn class_prop_relaxes_skeleton() {
+        use budget::AssetClass::*;
+        let doc = json!({
+            "nodes": [{"name": "Crate", "mesh": 0}],
+            "meshes": [{"name": "Crate", "primitives": [{}]}],
+            "animations": [{
+                "channels": [{"target": {"node": 0}}],
+                "samplers": [{}],
+            }],
+        });
+        let bytes = pack(&doc);
+        // Props may be unrigged, anims included.
+        let r = classed(&bytes, Prop);
+        assert!(r.diags.is_empty(), "prop relaxes: {:?}", diags_str(&r));
+        // Characters and unclassed runs still require a skeleton.
+        let r = classed(&bytes, Npc);
+        assert!(codes(&r).contains(&"R_NO_SKIN"));
+        assert!(codes(&r).contains(&"R_ANIM_TARGET"));
+        let r = check_glb(&bytes);
+        assert!(codes(&r).contains(&"R_NO_SKIN"));
+        // A rigged prop still faces the full contract.
+        let mut rigged = doc.clone();
+        rigged["nodes"][0]["skin"] = json!(0);
+        rigged["skins"] = json!([{"joints": [0]}]);
+        let r = classed(&pack(&rigged), Prop);
+        assert!(codes(&r).contains(&"R_JOINT_PREFIX"));
     }
 
     #[test]

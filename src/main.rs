@@ -18,13 +18,16 @@ use std::process::ExitCode;
 
 fn print_help() {
     println!(
-        "usage: rfcheck [--json] [--mobile] [--budget file] [--] file.glb ...\n\
+        "usage: rfcheck [--json] [--mobile] [--budget file] [--class name] [--] file.glb ...\n\
          \n\
          Check each GLB against the rigforge export contract and print\n\
          one `CODE path: detail` line per finding (OK line when clean).\n\
          Exit 0 = clean, 1 = contract failures, 2 = usage/environment error.\n\
          --mobile checks mobile perf budgets too (P_* warnings, never fail).\n\
-         --budget file overrides budget keys via a JSON object or flat TOML."
+         --budget file overrides budget keys via a JSON object or flat TOML.\n\
+         --class name checks as one asset class (hero, npc, monster, prop,\n\
+         weapon): per-class mobile budgets, and prop/weapon files may be\n\
+         unrigged. Implies budget checks, like --budget."
     );
 }
 
@@ -33,6 +36,7 @@ fn main() -> ExitCode {
     let mut json_out = false;
     let mut want_budget = false;
     let mut budget_path: Option<&str> = None;
+    let mut class: Option<budget::AssetClass> = None;
     let mut files: Vec<&str> = Vec::new();
     let mut only_files = false;
     let mut i = 0;
@@ -55,6 +59,25 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             }
+        } else if a == "--class" {
+            i += 1;
+            match raw.get(i) {
+                Some(p) => match budget::parse_class(p) {
+                    Some(c) => class = Some(c),
+                    None => {
+                        eprintln!(
+                            "rfcheck: unknown asset class '{p}' \
+                             (expected {})",
+                            budget::CLASS_NAMES
+                        );
+                        return ExitCode::from(2);
+                    }
+                },
+                None => {
+                    eprintln!("rfcheck: --class needs a name argument (see --help)");
+                    return ExitCode::from(2);
+                }
+            }
         } else if a == "-h" || a == "--help" {
             print_help();
             return ExitCode::SUCCESS;
@@ -71,15 +94,19 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let budget: Option<budget::Budget> = match &budget_path {
-        Some(p) => match budget::load_budget(Path::new(p)) {
+    // --class implies budget checks (mobile profile), like --budget.
+    if class.is_some() {
+        want_budget = true;
+    }
+    let budgets: Option<budget::BudgetSet> = match &budget_path {
+        Some(p) => match budget::load_budget_set(Path::new(p)) {
             Ok(b) => Some(b),
             Err(e) => {
                 eprintln!("rfcheck: {e}");
                 return ExitCode::from(2);
             }
         },
-        None if want_budget => Some(budget::Budget::default()),
+        None if want_budget => Some(budget::BudgetSet::mobile()),
         None => None,
     };
 
@@ -105,8 +132,8 @@ fn main() -> ExitCode {
                 continue;
             }
         };
-        let report = match &budget {
-            Some(b) => checks::check_glb_with_budget(&bytes, Some(b)),
+        let report = match &budgets {
+            Some(s) => checks::check_glb_with_class(&bytes, Some(s.for_class(class)), class),
             None => checks::check_glb(&bytes),
         };
         if json_out {

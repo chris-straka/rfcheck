@@ -10,6 +10,8 @@ cargo build --release
 ./target/release/rfcheck --json hero.glb   # machine-readable
 ./target/release/rfcheck --mobile hero.glb # + perf-budget warnings
 ./target/release/rfcheck --budget phone.toml hero.glb
+./target/release/rfcheck --class hero hero.glb   # per-class budgets
+./target/release/rfcheck --class weapon sword.glb # weapons may be unrigged
 ```
 
 Output is one `CODE path: detail` line per finding, `OK path: summary`
@@ -42,6 +44,12 @@ A game-bound rig GLB must:
 Skeleton-only exports (no meshes) are valid. Clean files report
 `max N infl/vert` in the `OK` summary.
 
+`--class prop` and `--class weapon` relax the skeleton requirement:
+static props and weapons are legitimately unrigged, so an unrigged
+file passes (animation targets go unchecked with it — there is no
+DEF rule to check them against). A rigged prop still faces the full
+contract above.
+
 ## Codes
 
 | Code | Meaning |
@@ -70,7 +78,12 @@ Skeleton-only exports (no meshes) are valid. Clean files report
 | `P_VERTS` | mesh vertex count over budget (warn) |
 | `P_TRIS` | mesh triangle count over budget (warn) |
 | `P_TEX_SIZE` | texture dims over budget (warn) |
+| `P_TEX_NORMAL` | character with no normal map (warn) |
 | `P_INFLUENCES` | max influences/vert over budget (warn) |
+| `P_BONES` | deform-bone count over budget (warn) |
+| `P_PIECE_BONES` | cape/hair skinned to non-body bones (warn) |
+| `P_WEAPON_SKIN` | weapon file carries a skin (warn) |
+| `P_WEAPON_ATTACH` | weapon file lacks an `ATTACH-*` node (warn) |
 
 `D_*` codes mirror `animforge/dcc/export_check.py`, whose container
 checks are deliberately duplicated here (asset hygiene vs rig
@@ -102,6 +115,43 @@ Defaults target a 2024 flagship (Samsung Galaxy S24 class floor):
 | `max_verts_per_mesh` | 65,535 | order of the 16-bit index ceiling: past this a mesh cannot draw in one UINT16-indexed call, so engines split prims or widen to 32-bit indices — both cost on tile-based GPUs |
 | `max_texture_dim` | 2048 | largest single texture on a mobile hero; a 4k RGBA costs 16 MB even ASTC-compressed, and 2k is standard phone practice |
 | `max_influences` | 4 | matches the rig contract: 4-bone skinning is the mobile GPU standard; tighten for low-end targets |
+| `max_bones` | 256 | 256 matrices × 64 B = 16 KB, exactly the guaranteed UBO size; past this the palette cannot upload everywhere |
+
+## Asset classes (`--class`)
+
+`--class hero|npc|monster|prop|weapon` checks the file against that
+class's mobile-profile budget instead of the generic flagship one.
+Class runs name the class in each warn (`exceed 15000 hero budget`),
+in the summary (`, class hero`), and in JSON (`"class"` key, present
+only for classed runs). `--class` implies budget checks, like
+`--budget`.
+
+| Class | Tris | Verts | Tex px | Infl | Bones |
+| --- | --- | --- | --- | --- | --- |
+| `hero` | 15,000 | 10,000 | 1024 | 4 | 128 |
+| `npc` | 8,000 | 6,000 | 512 | 4 | 128 |
+| `monster` | 20,000 | 12,000 | 1024 | 4 | 128 |
+| `prop` | 2,000 | 1,500 | 512 | 4 | 64 |
+| `weapon` | 2,000 | 1,500 | 512 | 4 | 16 |
+
+Heroes follow HLL art direction (5k–15k tris, 512–1024 px textures);
+NPCs wrap the hero base today so they share its bone budget until
+the lighter mobile rig lands; monsters may exceed heroes (one large
+boss draw, not a crowd); props and weapons are small static draws.
+
+Class runs also enable convention checks (still WARN-level):
+
+- Characters (`hero`, `npc`, `monster`) ship a baked normal map:
+  `P_TEX_NORMAL` fires when no material carries `normalTexture`.
+- Detachable pieces — meshes whose name contains `cape`, `cloak`,
+  `hair`, `ponytail`, or `braid` — get body weights via Data
+  Transfer, so `P_PIECE_BONES` fires when a piece mesh uses a bone
+  that carries no body weight. Piece-only files and unreadable
+  weights skip silently (nothing provable).
+- Weapons (`--class weapon` only) attach to the hand bone in Godot
+  (`BoneAttachment3D`): `P_WEAPON_SKIN` fires when the file carries
+  a skin, `P_WEAPON_ATTACH` when no node is named `ATTACH-*` (the
+  grip point the importer snaps to the hand).
 
 Measurement notes: verts/tris are per mesh (summed over
 primitives, from accessor counts); tris count triangle lists only
@@ -110,7 +160,9 @@ excluded). Texture dims are sniffed from embedded PNG/JPEG/KTX2
 headers — glTF JSON carries no width/height — so external/data-URI
 images and foreign codecs are skipped silently (unmeasured, not
 over-budget). `P_INFLUENCES` reuses the weight layer's stats, so
-prims it could not read contribute nothing here either. Like `X_*`,
+prims it could not read contribute nothing here either. `P_BONES`
+counts unique `DEF-*` joint nodes across all skins (non-DEF joints
+are the contract layer's business, not the budget's). Like `X_*`,
 a mesh warns only on provable counts: unknown prims are noted
 (`+N uncounted`) and can only add, so a warn on partial data is
 still sound.
@@ -118,8 +170,8 @@ still sound.
 `--budget <file>` overrides any subset of the defaults (missing
 keys keep mobile defaults; unknown keys are an error, so typos fail
 loudly). Format is sniffed from content — a leading `{` means JSON,
-anything else the flat TOML subset (`key = value` lines, `#`
-comments, no sections):
+anything else the TOML subset (`key = value` lines, `#` comments,
+`[class.X]` sections):
 
 ```json
 {"max_tris_per_mesh": 50000, "max_texture_dim": 1024}
@@ -131,10 +183,32 @@ max_tris_per_mesh = 50000
 max_verts_per_mesh = 32767
 max_texture_dim = 1024
 max_influences = 2
+max_bones = 96
 ```
 
 `--budget` implies budget checks; `--mobile --budget file` is the
 same run spelled explicitly.
+
+Per-class overrides live in `[class.X]` sections (TOML) or the
+`"class"` object (JSON). Each key resolves section first, then the
+file top level, then the mobile-profile default — so a flat file
+keeps meaning "every asset", and a section only narrows its class:
+
+```toml
+max_tris_per_mesh = 50000
+
+[class.hero]
+max_tris_per_mesh = 15000
+max_bones = 100
+```
+
+```json
+{"max_tris_per_mesh": 50000,
+ "class": {"hero": {"max_tris_per_mesh": 15000, "max_bones": 100}}}
+```
+
+Unknown classes, unknown keys, and non-`[class.X]` sections are all
+errors.
 
 ## Roadmap
 
@@ -145,6 +219,10 @@ same run spelled explicitly.
   morph counts).
 - v4: done — `P_*` perf-budget layer (`--mobile`, `--budget`;
   per-mesh verts/tris, texture dims, influences; WARN-level).
+- v5: done — per-class budgets (`--class`, mobile profile per asset
+  class), bone budget (`P_BONES`), normal-map (`P_TEX_NORMAL`),
+  piece (`P_PIECE_BONES`), and weapon (`P_WEAPON_SKIN`,
+  `P_WEAPON_ATTACH`) warnings; prop/weapon runs may be unrigged.
 - HLL CI wiring: done — `validate_assets.py` shells out for inbound
   character/creature GLBs, and HLL's CI installs rfcheck via cargo.
 

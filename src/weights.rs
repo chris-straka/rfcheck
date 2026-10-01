@@ -8,6 +8,7 @@
 //! never a silent skip or a panic.
 
 use serde_json::Value;
+use std::collections::BTreeSet;
 
 /// Game-rig limit: at most 4 nonzero influences per vertex.
 pub const MAX_INFLUENCES: usize = 4;
@@ -402,4 +403,97 @@ pub fn check_weights(json: &Value, bin: &[u8]) -> (Vec<(&'static str, String)>, 
         }
     }
     (out, stats)
+}
+
+/// Node indices carrying nonzero weight for one mesh, resolved
+/// through the skin bound to it. Powers the piece check (a cape may
+/// only use bones the body uses). None when the mesh has no skin
+/// binding, no skinned prim, or unreadable weight data — the weight
+/// layer owns those verdicts, so this only answers "which bones".
+/// Validation mirrors `check_weights` deliberately: sharing it would
+/// couple the FAIL-level weight verdicts to this advisory scan.
+pub(crate) fn used_nodes(json: &Value, bin: &[u8], mi: usize) -> Option<BTreeSet<usize>> {
+    let mesh = arr(json, "meshes").get(mi)?;
+    let si = arr(json, "nodes").iter().find_map(|n| {
+        if n.get("mesh").and_then(as_idx) == Some(mi) {
+            n.get("skin").and_then(as_idx)
+        } else {
+            None
+        }
+    })?;
+    let skin = arr(json, "skins").get(si)?;
+    let joints = arr(skin, "joints");
+    let accs = arr(json, "accessors");
+    let mut used: BTreeSet<usize> = BTreeSet::new();
+    let mut any = false;
+    for prim in arr(mesh, "primitives") {
+        let attrs = prim.get("attributes");
+        let acc_idx = |key: &str| attrs.and_then(|a| a.get(key)).and_then(as_idx);
+        let (Some(j0), Some(w0)) = (acc_idx("JOINTS_0"), acc_idx("WEIGHTS_0")) else {
+            continue;
+        };
+        let mut sets = vec![(j0, w0)];
+        for n in 1.. {
+            let jk = format!("JOINTS_{n}");
+            let wk = format!("WEIGHTS_{n}");
+            match (acc_idx(&jk), acc_idx(&wk)) {
+                (None, None) => break,
+                (Some(j), Some(w)) => sets.push((j, w)),
+                _ => return None,
+            }
+        }
+        if sets.iter().any(|(j, w)| {
+            [*j, *w]
+                .iter()
+                .any(|ai| accs.get(*ai).and_then(|a| a.get("sparse")).is_some())
+        }) {
+            return None;
+        }
+        let mut layouts: Vec<(Layout, Layout)> = Vec::new();
+        for (j, w) in &sets {
+            let (Ok(jl), Ok(wl)) = (
+                layout_of(json, bin.len(), *j, "JOINTS"),
+                layout_of(json, bin.len(), *w, "WEIGHTS"),
+            ) else {
+                return None;
+            };
+            if jl.ncomp != 4 || (jl.comp != 5121 && jl.comp != 5123) {
+                return None;
+            }
+            let w_ok = wl.ncomp == 4
+                && (wl.comp == 5126 || (wl.normalized && (wl.comp == 5121 || wl.comp == 5123)));
+            if !w_ok {
+                return None;
+            }
+            layouts.push((jl, wl));
+        }
+        let count = layouts[0].1.count;
+        if layouts
+            .iter()
+            .any(|(j, w)| j.count != count || w.count != count)
+        {
+            return None;
+        }
+        for v in 0..count {
+            for (jl, wl) in &layouts {
+                for k in 0..4 {
+                    let (Some(j), Some(x)) = (uint_at(bin, jl, v, k), weight_at(bin, wl, v, k))
+                    else {
+                        return None;
+                    };
+                    if x != 0.0 {
+                        if let Some(n) = usize::try_from(j)
+                            .ok()
+                            .and_then(|s| joints.get(s))
+                            .and_then(as_idx)
+                        {
+                            used.insert(n);
+                        }
+                    }
+                }
+            }
+        }
+        any = true;
+    }
+    any.then_some(used)
 }
