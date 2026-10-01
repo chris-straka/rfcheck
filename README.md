@@ -8,11 +8,15 @@ tests, and against any rigger's output (hello, bake-off).
 cargo build --release
 ./target/release/rfcheck hero.glb stalker.glb
 ./target/release/rfcheck --json hero.glb   # machine-readable
+./target/release/rfcheck --mobile hero.glb # + perf-budget warnings
+./target/release/rfcheck --budget phone.toml hero.glb
 ```
 
 Output is one `CODE path: detail` line per finding, `OK path: summary`
 when clean. Exit 0 = clean, 1 = contract failures, 2 = usage/IO error
 (same shape as `animforge/dcc/export_check.py`, deliberately).
+Budget (`P_*`) findings are warnings: they print like findings but
+never fail, so exit stays 0 unless a contract layer also fires.
 
 ## Contract (v3)
 
@@ -63,6 +67,10 @@ Skeleton-only exports (no meshes) are valid. Clean files report
 | `X_EMPTY_MESH` | mesh with no primitives or zero vertices |
 | `X_EMPTY_PRIM` | primitive with zero vertices and zero indices |
 | `X_MORPH_COUNT` | morph weights/targets/counts disagree |
+| `P_VERTS` | mesh vertex count over budget (warn) |
+| `P_TRIS` | mesh triangle count over budget (warn) |
+| `P_TEX_SIZE` | texture dims over budget (warn) |
+| `P_INFLUENCES` | max influences/vert over budget (warn) |
 
 `D_*` codes mirror `animforge/dcc/export_check.py`, whose container
 checks are deliberately duplicated here (asset hygiene vs rig
@@ -76,6 +84,58 @@ silently; a bounds failure on a skinning accessor may additionally
 surface as `W_BAD_ACCESSOR`, since the weight layer owns its own
 reads.
 
+## Perf budgets (`P_*`, opt-in)
+
+`--mobile` checks the file against phone-class perf budgets. These
+are WARN-level by design: a mesh that passes every contract check
+but blows the triangle budget warns, it does not fail — correctness
+stays FAIL-level, budgets answer "will this hurt on a phone". Plain
+`rfcheck` without flags runs no budget checks at all (v0.3.0
+behavior, byte-identical output). `--json` gains a `"warns"` array
+only when budget checks ran.
+
+Defaults target a 2024 flagship (Samsung Galaxy S24 class floor):
+
+| Key | Default | Rationale |
+| --- | --- | --- |
+| `max_tris_per_mesh` | 100,000 | engines ship mobile heroes at 50–100k tris per character draw (Unity URP / UE5 mobile guidance) |
+| `max_verts_per_mesh` | 65,535 | order of the 16-bit index ceiling: past this a mesh cannot draw in one UINT16-indexed call, so engines split prims or widen to 32-bit indices — both cost on tile-based GPUs |
+| `max_texture_dim` | 2048 | largest single texture on a mobile hero; a 4k RGBA costs 16 MB even ASTC-compressed, and 2k is standard phone practice |
+| `max_influences` | 4 | matches the rig contract: 4-bone skinning is the mobile GPU standard; tighten for low-end targets |
+
+Measurement notes: verts/tris are per mesh (summed over
+primitives, from accessor counts); tris count triangle lists only
+(points/lines/other modes carry no triangle-list cost and are
+excluded). Texture dims are sniffed from embedded PNG/JPEG/KTX2
+headers — glTF JSON carries no width/height — so external/data-URI
+images and foreign codecs are skipped silently (unmeasured, not
+over-budget). `P_INFLUENCES` reuses the weight layer's stats, so
+prims it could not read contribute nothing here either. Like `X_*`,
+a mesh warns only on provable counts: unknown prims are noted
+(`+N uncounted`) and can only add, so a warn on partial data is
+still sound.
+
+`--budget <file>` overrides any subset of the defaults (missing
+keys keep mobile defaults; unknown keys are an error, so typos fail
+loudly). Format is sniffed from content — a leading `{` means JSON,
+anything else the flat TOML subset (`key = value` lines, `#`
+comments, no sections):
+
+```json
+{"max_tris_per_mesh": 50000, "max_texture_dim": 1024}
+```
+
+```toml
+# low-end phone profile
+max_tris_per_mesh = 50000
+max_verts_per_mesh = 32767
+max_texture_dim = 1024
+max_influences = 2
+```
+
+`--budget` implies budget checks; `--mobile --budget file` is the
+same run spelled explicitly.
+
 ## Roadmap
 
 - v2: done — BIN weight stats (max influences per vertex,
@@ -83,6 +143,8 @@ reads.
 - v3: done — `X_*` objective-defect layer (accessor bounds,
   animation NaN/keyframes, joint ranges, empty geometry,
   morph counts).
+- v4: done — `P_*` perf-budget layer (`--mobile`, `--budget`;
+  per-mesh verts/tris, texture dims, influences; WARN-level).
 - HLL CI wiring: done — `validate_assets.py` shells out for inbound
   character/creature GLBs, and HLL's CI installs rfcheck via cargo.
 

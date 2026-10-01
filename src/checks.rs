@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Rig-contract checks over a parsed GLB document.
 
+use crate::budget;
 use crate::defects;
 use crate::glb;
 use crate::weights;
@@ -13,6 +14,9 @@ pub struct Diag {
 
 pub struct Report {
     pub diags: Vec<Diag>,
+    /// Budget (P_*) warnings. None when no budget was requested, in
+    /// which case the report (and its JSON shape) is exactly v0.3.0.
+    pub warns: Option<Vec<Diag>>,
     pub summary: String,
 }
 
@@ -21,19 +25,31 @@ impl Report {
         !self.diags.is_empty()
     }
 
+    pub fn warnings(&self) -> &[Diag] {
+        self.warns.as_deref().unwrap_or(&[])
+    }
+
     pub fn to_json(&self, path: &std::path::Path) -> String {
         let diags: Vec<Value> = self
             .diags
             .iter()
             .map(|d| json!({"code": d.code, "detail": d.detail}))
             .collect();
-        json!({
-            "file": path.display().to_string(),
-            "ok": !self.failed(),
-            "summary": self.summary,
-            "diags": diags,
-        })
-        .to_string()
+        let mut map = serde_json::Map::new();
+        map.insert("file".to_string(), json!(path.display().to_string()));
+        map.insert("ok".to_string(), json!(!self.failed()));
+        map.insert("summary".to_string(), json!(self.summary));
+        map.insert("diags".to_string(), Value::Array(diags));
+        // No "warns" key at all unless budgets ran: plain runs keep the
+        // v0.3.0 JSON shape byte-for-byte.
+        if let Some(warns) = &self.warns {
+            let warns: Vec<Value> = warns
+                .iter()
+                .map(|d| json!({"code": d.code, "detail": d.detail}))
+                .collect();
+            map.insert("warns".to_string(), Value::Array(warns));
+        }
+        Value::Object(map).to_string()
     }
 }
 
@@ -61,11 +77,16 @@ fn join_names(names: &[String]) -> String {
 }
 
 pub fn check_glb(bytes: &[u8]) -> Report {
+    check_glb_with_budget(bytes, None)
+}
+
+pub fn check_glb_with_budget(bytes: &[u8], budget: Option<&budget::Budget>) -> Report {
     let doc = match glb::parse(bytes) {
         Ok(d) => d,
         Err((code, detail)) => {
             return Report {
                 diags: vec![Diag { code, detail }],
+                warns: None,
                 summary: "invalid container".to_string(),
             };
         }
@@ -157,6 +178,13 @@ pub fn check_glb(bytes: &[u8]) -> Report {
         diags.push(Diag { code, detail });
     }
 
+    let warns: Option<Vec<Diag>> = budget.map(|b| {
+        budget::check_budgets(json, doc.bin, b, &skin)
+            .into_iter()
+            .map(|(code, detail)| Diag { code, detail })
+            .collect()
+    });
+
     let mut summary = format!(
         "{} joint{}, {} mesh{}, {} clip{}",
         joints.len(),
@@ -169,12 +197,22 @@ pub fn check_glb(bytes: &[u8]) -> Report {
     if skin.checked_prims > 0 {
         summary.push_str(&format!(", max {} infl/vert", skin.max_influences));
     }
-    Report { diags, summary }
+    if let Some(w) = &warns {
+        if !w.is_empty() {
+            summary.push_str(&format!(", {} over budget", w.len()));
+        }
+    }
+    Report {
+        diags,
+        warns,
+        summary,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn pack(doc: &Value) -> Vec<u8> {
         let body = serde_json::to_vec(doc).unwrap();
@@ -823,6 +861,210 @@ mod tests {
             found.iter().any(|d| d.contains("POSITION count 5")),
             "no target-count diag: {found:?}"
         );
+    }
+
+    fn wcodes(report: &Report) -> Vec<&'static str> {
+        report.warnings().iter().map(|d| d.code).collect()
+    }
+
+    fn warn_for<'a>(r: &'a Report, code: &str) -> Option<&'a str> {
+        r.warnings()
+            .iter()
+            .find(|d| d.code == code)
+            .map(|d| d.detail.as_str())
+    }
+
+    fn mesh_budget_doc(verts: u64, idx: u64) -> (Value, Vec<u8>) {
+        // POSITION bytes + U16 index bytes, sized so X_ACCESSOR_BOUNDS
+        // stays quiet: budget tests must isolate the P_* layer.
+        let pv = verts as usize * 12;
+        let ib = idx as usize * 2;
+        let doc = json!({
+            "nodes": [{"name": "DEF-a"}],
+            "skins": [{"joints": [0]}],
+            "meshes": [{"name": "Hero", "primitives": [
+                {"attributes": {"POSITION": 0}, "indices": 1},
+            ]}],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "type": "VEC3", "count": verts},
+                {"bufferView": 1, "componentType": 5123, "type": "SCALAR", "count": idx},
+            ],
+            "bufferViews": [
+                {"byteOffset": 0, "byteLength": pv},
+                {"byteOffset": pv, "byteLength": ib},
+            ],
+            "buffers": [{"byteLength": pv + ib}],
+        });
+        (doc, vec![0u8; pv + ib])
+    }
+
+    fn png_hdr(w: u32, h: u32) -> Vec<u8> {
+        let mut b = b"\x89PNG\r\n\x1a\n".to_vec();
+        b.extend_from_slice(&13u32.to_be_bytes());
+        b.extend_from_slice(b"IHDR");
+        b.extend_from_slice(&w.to_be_bytes());
+        b.extend_from_slice(&h.to_be_bytes());
+        b.extend_from_slice(&[8, 2, 0, 0, 0]);
+        b
+    }
+
+    #[test]
+    fn mobile_over_budget_mesh_warns_not_fails() {
+        let (doc, bin) = mesh_budget_doc(70_000, 300_003);
+        let r = check_glb_with_budget(&pack_bin(&doc, &bin), Some(&budget::Budget::default()));
+        assert!(r.diags.is_empty(), "must not fail: {:?}", diags_str(&r));
+        assert!(!r.failed());
+        assert_eq!(wcodes(&r), vec!["P_VERTS", "P_TRIS"]);
+        let v = warn_for(&r, "P_VERTS").unwrap();
+        assert!(v.contains("70000 verts"), "no count: {v}");
+        assert!(v.contains("65535"), "no budget: {v}");
+        let t = warn_for(&r, "P_TRIS").unwrap();
+        assert!(t.contains("100001 tris"), "no count: {t}");
+        assert!(
+            r.summary.ends_with(", 2 over budget"),
+            "summary: {}",
+            r.summary
+        );
+        let j = r.to_json(Path::new("hero.glb"));
+        assert!(j.contains("\"ok\":true"), "json: {j}");
+        assert!(j.contains("\"warns\":"), "json: {j}");
+    }
+
+    #[test]
+    fn mobile_under_budget_passes() {
+        let (doc, bin) = mesh_budget_doc(1_000, 3_000);
+        let r = check_glb_with_budget(&pack_bin(&doc, &bin), Some(&budget::Budget::default()));
+        assert!(r.diags.is_empty(), "unexpected: {:?}", diags_str(&r));
+        assert!(r.warnings().is_empty());
+        assert!(!r.summary.contains("over budget"), "summary: {}", r.summary);
+        // Budgets ran (empty warns array proves it), file is clean.
+        let j: Value = serde_json::from_str(&r.to_json(Path::new("ok.glb"))).unwrap();
+        assert_eq!(j["warns"], json!([]));
+        assert_eq!(j["ok"], json!(true));
+    }
+
+    #[test]
+    fn mobile_points_excluded_from_tris() {
+        let (mut doc, _) = mesh_budget_doc(70_000, 0);
+        doc["meshes"][0]["primitives"][0]["mode"] = json!(0);
+        doc["meshes"][0]["primitives"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("indices");
+        let bin = vec![0u8; 70_000 * 12];
+        doc["accessors"] = json!([
+            {"bufferView": 0, "componentType": 5126, "type": "VEC3", "count": 70_000},
+        ]);
+        doc["bufferViews"] = json!([{"byteOffset": 0, "byteLength": 70_000 * 12}]);
+        doc["buffers"] = json!([{"byteLength": 70_000 * 12}]);
+        let r = check_glb_with_budget(&pack_bin(&doc, &bin), Some(&budget::Budget::default()));
+        assert_eq!(wcodes(&r), vec!["P_VERTS"]);
+    }
+
+    #[test]
+    fn mobile_no_flag_run_unchanged() {
+        let (doc, bin) = mesh_budget_doc(70_000, 300_000);
+        let bytes = pack_bin(&doc, &bin);
+        let r = check_glb(&bytes);
+        assert!(r.warns.is_none(), "no budget output unless asked");
+        assert!(r.diags.is_empty(), "unexpected: {:?}", diags_str(&r));
+        assert_eq!(r.summary, "1 joint, 1 mesh, 0 clips");
+        // v0.3.0 JSON shape byte-for-byte: no "warns" key at all.
+        let j: Value = serde_json::from_str(&r.to_json(Path::new("hero.glb"))).unwrap();
+        let keys: Vec<&str> = j.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["diags", "file", "ok", "summary"]);
+    }
+
+    #[test]
+    fn mobile_custom_budget_overrides() {
+        let (sdoc, sbin) = mesh_budget_doc(1_000, 3_000);
+        let tight = budget::parse_budget(r#"{"max_verts_per_mesh": 500}"#).unwrap();
+        let r = check_glb_with_budget(&pack_bin(&sdoc, &sbin), Some(&tight));
+        assert!(r.diags.is_empty());
+        assert_eq!(wcodes(&r), vec!["P_VERTS"]); // tris still under default
+        let (bdoc, bbin) = mesh_budget_doc(70_000, 300_000);
+        let loose =
+            budget::parse_budget("max_verts_per_mesh = 999999\nmax_tris_per_mesh = 999999\n")
+                .unwrap();
+        let r = check_glb_with_budget(&pack_bin(&bdoc, &bbin), Some(&loose));
+        assert!(r.diags.is_empty());
+        assert!(r.warnings().is_empty(), "loose budget must pass");
+    }
+
+    #[test]
+    fn mobile_influences_warn_not_fail() {
+        // 1 vertex, 4 influences: passes the rig contract exactly.
+        let mut bin = vec![0, 1, 2, 3];
+        bin.extend_from_slice(&f32s(&[0.25, 0.25, 0.25, 0.25]));
+        let doc = skel_doc(
+            json!({"JOINTS_0": 0, "WEIGHTS_0": 1}),
+            json!([
+                {"bufferView": 0, "componentType": 5121, "type": "VEC4", "count": 1},
+                {"bufferView": 1, "componentType": 5126, "type": "VEC4", "count": 1},
+            ]),
+            json!([
+                {"byteOffset": 0, "byteLength": 4},
+                {"byteOffset": 4, "byteLength": 16},
+            ]),
+            bin.len(),
+        );
+        let bytes = pack_bin(&doc, &bin);
+        let base = check_glb(&bytes);
+        assert!(base.diags.is_empty(), "unexpected: {:?}", diags_str(&base));
+        assert_eq!(base.summary, "4 joints, 1 mesh, 0 clips, max 4 infl/vert");
+        // Default mobile budget agrees (4 is the phone standard); a
+        // low-end override warns while the contract still passes.
+        let strict = budget::parse_budget(r#"{"max_influences": 2}"#).unwrap();
+        let r = check_glb_with_budget(&bytes, Some(&strict));
+        assert!(
+            r.diags.is_empty(),
+            "budget must not fail: {:?}",
+            diags_str(&r)
+        );
+        assert!(!r.failed());
+        assert_eq!(wcodes(&r), vec!["P_INFLUENCES"]);
+        let d = warn_for(&r, "P_INFLUENCES").unwrap();
+        assert!(d.contains("max 4 infl/vert"), "no count: {d}");
+        assert!(d.contains("exceeds 2 budget"), "no budget: {d}");
+        let r = check_glb_with_budget(&bytes, Some(&budget::Budget::default()));
+        assert!(r.warnings().is_empty(), "default allows 4 influences");
+    }
+
+    #[test]
+    fn mobile_texture_warn_and_skip() {
+        let img_doc = |images: Value, blen: usize| {
+            json!({
+                "nodes": [{"name": "DEF-a"}],
+                "skins": [{"joints": [0]}],
+                "images": images,
+                "bufferViews": [{"byteOffset": 0, "byteLength": blen}],
+                "buffers": [{"byteLength": blen}],
+            })
+        };
+        let big = png_hdr(4096, 4096);
+        let doc = img_doc(
+            json!([{"name": "Big", "bufferView": 0, "mimeType": "image/png"}]),
+            big.len(),
+        );
+        let r = check_glb_with_budget(&pack_bin(&doc, &big), Some(&budget::Budget::default()));
+        assert!(r.diags.is_empty(), "unexpected: {:?}", diags_str(&r));
+        assert_eq!(wcodes(&r), vec!["P_TEX_SIZE"]);
+        let d = warn_for(&r, "P_TEX_SIZE").unwrap();
+        assert!(d.contains("4096x4096"), "no dims: {d}");
+        assert!(d.contains("2048px"), "no budget: {d}");
+        // Small embedded PNG + external URI: measured-pass and
+        // unmeasured-skip are both silent.
+        let small = png_hdr(64, 64);
+        let doc = img_doc(
+            json!([
+                {"name": "Small", "bufferView": 0, "mimeType": "image/png"},
+                {"name": "Ext", "uri": "https://example.com/tex.png"},
+            ]),
+            small.len(),
+        );
+        let r = check_glb_with_budget(&pack_bin(&doc, &small), Some(&budget::Budget::default()));
+        assert!(r.diags.is_empty(), "unexpected: {:?}", diags_str(&r));
+        assert!(r.warnings().is_empty());
     }
 
     #[test]
