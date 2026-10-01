@@ -6,9 +6,11 @@ use serde_json::Value;
 
 pub const MAGIC_GLTF: &[u8; 4] = b"glTF";
 pub const CHUNK_JSON: u32 = 0x4E4F534A;
+pub const CHUNK_BIN: u32 = 0x004E4942;
 
-pub struct Document {
+pub struct Document<'a> {
     pub json: Value,
+    pub bin: &'a [u8],
 }
 
 fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
@@ -18,7 +20,7 @@ fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
 
 /// Parse the container; on success return the JSON chunk.
 /// Err is (diagnostic code, detail).
-pub fn parse(bytes: &[u8]) -> Result<Document, (&'static str, String)> {
+pub fn parse(bytes: &[u8]) -> Result<Document<'_>, (&'static str, String)> {
     if bytes.len() < 12 || &bytes[0..4] != MAGIC_GLTF {
         return Err(("D_GLB_MAGIC", "not a glTF binary container".to_string()));
     }
@@ -61,8 +63,33 @@ pub fn parse(bytes: &[u8]) -> Result<Document, (&'static str, String)> {
             "JSON chunk extends past end of file".to_string(),
         ));
     }
-    match serde_json::from_slice::<Value>(&bytes[start..end]) {
-        Ok(json) => Ok(Document { json }),
-        Err(e) => Err(("D_GLB_JSON", format!("JSON chunk does not parse: {e}"))),
+    let json: Value = match serde_json::from_slice::<Value>(&bytes[start..end]) {
+        Ok(json) => json,
+        Err(e) => return Err(("D_GLB_JSON", format!("JSON chunk does not parse: {e}"))),
+    };
+    let mut bin: &[u8] = &[];
+    if end < total {
+        let blen = match read_u32(bytes, end) {
+            Some(v) => v as usize,
+            None => return Err(("D_GLB_TRUNC", "BIN chunk header is truncated".to_string())),
+        };
+        let btype = read_u32(bytes, end + 4).unwrap_or(0);
+        let bstart = end + 8;
+        let bend = match bstart.checked_add(blen) {
+            Some(e) => e,
+            None => return Err(("D_GLB_TRUNC", "BIN chunk length overflows".to_string())),
+        };
+        if bend > bytes.len() {
+            return Err((
+                "D_GLB_TRUNC",
+                "BIN chunk extends past end of file".to_string(),
+            ));
+        }
+        // Unknown second-chunk types are ignored (forward-compatible);
+        // skinning reads then fail loudly as W_BAD_ACCESSOR, never silently.
+        if btype == CHUNK_BIN {
+            bin = &bytes[bstart..bend];
+        }
     }
+    Ok(Document { json, bin })
 }

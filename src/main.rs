@@ -7,6 +7,7 @@
 
 mod checks;
 mod glb;
+mod weights;
 
 use std::env;
 use std::fs;

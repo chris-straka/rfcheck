@@ -14,16 +14,24 @@ Output is one `CODE path: detail` line per finding, `OK path: summary`
 when clean. Exit 0 = clean, 1 = contract failures, 2 = usage/IO error
 (same shape as `animforge/dcc/export_check.py`, deliberately).
 
-## Contract (v1)
+## Contract (v2)
 
 A game-bound rig GLB must:
 
 - parse as a glTF 2.0 binary container,
 - contain a skeleton (`skins`, non-empty joints),
 - have every joint named `DEF-*` (no control/mechanism leaks),
-- have every animation channel target a `DEF-*` joint.
+- have every animation channel target a `DEF-*` joint,
+- blend at most 4 joints per skinned vertex (one
+  `JOINTS`/`WEIGHTS` set),
+- have skin weights summing to 1.0 (±0.001) on every skinned
+  vertex,
+- store skinning accessors dense (non-sparse) and well-formed
+  (`JOINTS_n` as `VEC4` `UNSIGNED_BYTE`/`SHORT`, `WEIGHTS_n` as
+  `VEC4` `FLOAT` or normalized `UNSIGNED_BYTE`/`SHORT`).
 
-Skeleton-only exports (no meshes) are valid.
+Skeleton-only exports (no meshes) are valid. Clean files report
+`max N infl/vert` in the `OK` summary.
 
 ## Codes
 
@@ -39,6 +47,10 @@ Skeleton-only exports (no meshes) are valid.
 | `R_JOINT_INDEX` | joint references missing node |
 | `R_JOINT_PREFIX` | non-`DEF-` joint exported |
 | `R_ANIM_TARGET` | animation targets non-`DEF-` node |
+| `W_OVER_INFLUENCE` | vertex blends more than 4 joints |
+| `W_UNNORMALIZED` | vertex weights do not sum to 1.0 |
+| `W_SPARSE` | skinning accessor is sparse (unchecked) |
+| `W_BAD_ACCESSOR` | skinning accessor unreadable/malformed |
 
 `D_*` codes mirror `animforge/dcc/export_check.py`, whose container
 checks are deliberately duplicated here (asset hygiene vs rig
@@ -46,8 +58,8 @@ contract are different layers; this tool owns its own parsing).
 
 ## Roadmap
 
-- v2: BIN weight stats (max influences per vertex, unnormalized
-  detection) via accessor parsing.
+- v2: done — BIN weight stats (max influences per vertex,
+  unnormalized detection) via accessor parsing.
 - HLL CI wiring: done — `validate_assets.py` shells out for inbound
   character/creature GLBs, and HLL's CI installs rfcheck via cargo.
 
