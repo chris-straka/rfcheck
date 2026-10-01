@@ -48,7 +48,7 @@ contract are different layers; this tool owns its own parsing).
 
 - v2: BIN weight stats (max influences per vertex, unnormalized
   detection) via accessor parsing.
-- HLL CI wiring: shell out from `validate_assets.py` for inbound
-  character/creature GLBs (the game's call).
+- HLL CI wiring: done — `validate_assets.py` shells out for inbound
+  character/creature GLBs, and HLL's CI installs rfcheck via cargo.
 
 License: MIT.
