@@ -38,16 +38,16 @@ fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
     }
 }
 
-struct Layout {
-    base: usize,
-    stride: usize,
-    count: usize,
-    comp: u32,
-    ncomp: usize,
-    normalized: bool,
+pub(crate) struct Layout {
+    pub(crate) base: usize,
+    pub(crate) stride: usize,
+    pub(crate) count: usize,
+    pub(crate) comp: u32,
+    pub(crate) ncomp: usize,
+    pub(crate) normalized: bool,
 }
 
-fn comp_size(comp: u32) -> Option<usize> {
+pub(crate) fn comp_size(comp: u32) -> Option<usize> {
     match comp {
         5120 | 5121 => Some(1),
         5122 | 5123 => Some(2),
@@ -58,7 +58,12 @@ fn comp_size(comp: u32) -> Option<usize> {
 
 /// Resolve an accessor to its BIN layout, bounds-checked. `what` names
 /// the attribute for error detail (e.g. "WEIGHTS_0").
-fn layout_of(json: &Value, bin_len: usize, ai: usize, what: &str) -> Result<Layout, String> {
+pub(crate) fn layout_of(
+    json: &Value,
+    bin_len: usize,
+    ai: usize,
+    what: &str,
+) -> Result<Layout, String> {
     let acc = arr(json, "accessors")
         .get(ai)
         .ok_or_else(|| format!("{what} accessor {ai} is out of range"))?;
@@ -154,6 +159,36 @@ fn weight_at(bin: &[u8], lay: &Layout, v: usize, k: usize) -> Option<f64> {
         5126 => Some(f32::from_le_bytes(bin.get(o..o + 4)?.try_into().ok()?) as f64),
         5121 => Some(f64::from(*bin.get(o)?) / 255.0),
         5123 => Some(f64::from(u16::from_le_bytes(bin.get(o..o + 2)?.try_into().ok()?)) / 65535.0),
+        _ => None,
+    }
+}
+
+/// Raw f32 read (FLOAT accessors only). Bounds-checked; None on
+/// any mismatch, so corrupt input can never panic.
+pub(crate) fn f32_at(bin: &[u8], lay: &Layout, v: usize, k: usize) -> Option<f32> {
+    if lay.comp != 5126 {
+        return None;
+    }
+    let o = lay
+        .base
+        .checked_add(v.checked_mul(lay.stride)?)?
+        .checked_add(k.checked_mul(4)?)?;
+    Some(f32::from_le_bytes(bin.get(o..o + 4)?.try_into().ok()?))
+}
+
+/// Raw joint-index read (UNSIGNED_BYTE/SHORT accessors only).
+/// Bounds-checked; None on any mismatch.
+pub(crate) fn uint_at(bin: &[u8], lay: &Layout, v: usize, k: usize) -> Option<u32> {
+    let csz = comp_size(lay.comp)?;
+    let o = lay
+        .base
+        .checked_add(v.checked_mul(lay.stride)?)?
+        .checked_add(k.checked_mul(csz)?)?;
+    match lay.comp {
+        5121 => Some(u32::from(*bin.get(o)?)),
+        5123 => Some(u32::from(u16::from_le_bytes(
+            bin.get(o..o + 2)?.try_into().ok()?,
+        ))),
         _ => None,
     }
 }

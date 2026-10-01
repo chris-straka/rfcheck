@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Rig-contract checks over a parsed GLB document.
 
+use crate::defects;
 use crate::glb;
 use crate::weights;
 use serde_json::{json, Value};
@@ -149,6 +150,10 @@ pub fn check_glb(bytes: &[u8]) -> Report {
 
     let (wdiags, skin) = weights::check_weights(json, doc.bin);
     for (code, detail) in wdiags {
+        diags.push(Diag { code, detail });
+    }
+
+    for (code, detail) in defects::check_defects(json, doc.bin) {
         diags.push(Diag { code, detail });
     }
 
@@ -605,5 +610,251 @@ mod tests {
             "{:?}",
             diags_str(&r)
         );
+    }
+
+    fn anim_doc(nan: bool) -> (Value, Vec<u8>) {
+        let doc = json!({
+            "nodes": [{"name": "DEF-a"}],
+            "skins": [{"joints": [0]}],
+            "animations": [{
+                "channels": [{"target": {"node": 0}}],
+                "samplers": [{"input": 0, "output": 1}],
+            }],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "type": "SCALAR", "count": 2},
+                {"bufferView": 1, "componentType": 5126, "type": "VEC3", "count": 2},
+            ],
+            "bufferViews": [
+                {"byteOffset": 0, "byteLength": 8},
+                {"byteOffset": 8, "byteLength": 24},
+            ],
+            "buffers": [{"byteLength": 32}],
+        });
+        let mut bin = f32s(&[0.0, 1.0]);
+        let tail = if nan {
+            [0.0, 0.0, 0.0, f32::NAN, f32::INFINITY, 1.0]
+        } else {
+            [0.0, 0.0, 0.0, 1.0, 2.0, 3.0]
+        };
+        bin.extend_from_slice(&f32s(&tail));
+        (doc, bin)
+    }
+
+    #[test]
+    fn defects_anim_nan() {
+        let (doc, bin) = anim_doc(true);
+        let r = check_glb(&pack_bin(&doc, &bin));
+        let d = detail_for(&r, "X_ANIM_NAN").expect("missing X_ANIM_NAN");
+        assert!(d.contains("clip 0 sampler 0"), "no sampler tag: {d}");
+        assert!(d.contains("accessor 1"), "no accessor ref: {d}");
+        assert!(d.contains("2 non-finite"), "no count: {d}");
+        assert!(d.contains("component 3"), "no first index: {d}");
+        assert!(detail_for(&r, "X_ANIM_KEYS").is_none());
+    }
+
+    #[test]
+    fn defects_anim_clean_passes() {
+        let (doc, bin) = anim_doc(false);
+        let r = check_glb(&pack_bin(&doc, &bin));
+        assert!(r.diags.is_empty(), "unexpected: {:?}", diags_str(&r));
+        assert_eq!(r.summary, "1 joint, 0 meshes, 1 clip");
+    }
+
+    #[test]
+    fn defects_anim_keys() {
+        let doc = json!({
+            "nodes": [{"name": "DEF-a"}],
+            "skins": [{"joints": [0]}],
+            "animations": [{
+                "channels": [{"target": {"node": 0}}],
+                "samplers": [{"input": 0, "output": 1}],
+            }],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "type": "SCALAR", "count": 0},
+                {"bufferView": 1, "componentType": 5126, "type": "VEC3", "count": 1},
+            ],
+            "bufferViews": [
+                {"byteOffset": 0, "byteLength": 0},
+                {"byteOffset": 0, "byteLength": 12},
+            ],
+            "buffers": [{"byteLength": 12}],
+        });
+        let r = check_glb(&pack_bin(&doc, &f32s(&[1.0, 2.0, 3.0])));
+        let d = detail_for(&r, "X_ANIM_KEYS").expect("missing X_ANIM_KEYS");
+        assert!(d.contains("0 keyframes"), "no count: {d}");
+        assert!(detail_for(&r, "X_ANIM_NAN").is_none());
+        assert!(detail_for(&r, "X_ACCESSOR_BOUNDS").is_none());
+    }
+
+    #[test]
+    fn defects_joint_range() {
+        let mut bin = vec![0, 1, 2, 9]; // index 9: skin has 4 joints
+        bin.extend_from_slice(&f32s(&[0.25, 0.25, 0.25, 0.25]));
+        let doc = skel_doc(
+            json!({"JOINTS_0": 0, "WEIGHTS_0": 1}),
+            json!([
+                {"bufferView": 0, "componentType": 5121, "type": "VEC4", "count": 1},
+                {"bufferView": 1, "componentType": 5126, "type": "VEC4", "count": 1},
+            ]),
+            json!([
+                {"byteOffset": 0, "byteLength": 4},
+                {"byteOffset": 4, "byteLength": 16},
+            ]),
+            bin.len(),
+        );
+        let r = check_glb(&pack_bin(&doc, &bin));
+        let d = detail_for(&r, "X_JOINT_RANGE").expect("missing X_JOINT_RANGE");
+        assert!(d.contains("JOINTS_0"), "no set tag: {d}");
+        assert!(d.contains("vertex 0 index 9"), "no location: {d}");
+        assert!(d.contains("has 4 joints"), "no skin size: {d}");
+        assert!(
+            !codes(&r).iter().any(|c| c.starts_with("W_")),
+            "weights are valid: {:?}",
+            diags_str(&r)
+        );
+    }
+
+    #[test]
+    fn defects_accessor_bounds() {
+        let doc = json!({
+            "nodes": [{"name": "DEF-a"}],
+            "skins": [{"joints": [0]}],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "type": "VEC3", "count": 3},
+                {"bufferView": 1, "componentType": 5126, "type": "VEC3", "count": 10},
+                {"bufferView": 2, "componentType": 5126, "type": "SCALAR", "count": 1},
+                {"bufferView": 3, "componentType": 5126, "type": "VEC3", "count": 1},
+            ],
+            "bufferViews": [
+                {"byteOffset": 0, "byteLength": 36},
+                {"byteOffset": 36, "byteLength": 12},
+                {"byteOffset": 1000, "byteLength": 100},
+                {"byteOffset": 48, "byteLength": 12, "byteStride": 4},
+            ],
+            "buffers": [{"byteLength": 60}],
+        });
+        let r = check_glb(&pack_bin(&doc, &[0u8; 60]));
+        let found: Vec<&str> = r
+            .diags
+            .iter()
+            .filter(|d| d.code == "X_ACCESSOR_BOUNDS")
+            .map(|d| d.detail.as_str())
+            .collect();
+        assert_eq!(found.len(), 3, "want 3 bounds diags: {found:?}");
+        assert!(
+            found.iter().any(|d| d.contains("bufferView 1")),
+            "no view diag: {found:?}"
+        );
+        assert!(
+            found.iter().any(|d| d.contains("buffer 0 byteLength 60")),
+            "no buffer diag: {found:?}"
+        );
+        assert!(
+            found.iter().any(|d| d.contains("byteStride 4")),
+            "no stride diag: {found:?}"
+        );
+    }
+
+    #[test]
+    fn defects_empty_mesh_prim() {
+        let doc = json!({
+            "nodes": [{"name": "DEF-a"}],
+            "skins": [{"joints": [0]}],
+            "meshes": [
+                {"name": "Ghost"},
+                {"name": "Flat", "primitives": [
+                    {"attributes": {"POSITION": 0}, "indices": 1},
+                ]},
+            ],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "type": "VEC3", "count": 0},
+                {"bufferView": 1, "componentType": 5123, "type": "SCALAR", "count": 0},
+            ],
+            "bufferViews": [
+                {"byteOffset": 0, "byteLength": 0},
+                {"byteOffset": 0, "byteLength": 0},
+            ],
+            "buffers": [{"byteLength": 0}],
+        });
+        let r = check_glb(&pack_bin(&doc, &[]));
+        let meshes = codes(&r).iter().filter(|c| **c == "X_EMPTY_MESH").count();
+        assert_eq!(meshes, 2, "want both mesh diags: {:?}", diags_str(&r));
+        let d = detail_for(&r, "X_EMPTY_PRIM").expect("missing X_EMPTY_PRIM");
+        assert!(d.contains("zero indices"), "wrong prim detail: {d}");
+        assert!(detail_for(&r, "X_ACCESSOR_BOUNDS").is_none());
+    }
+
+    #[test]
+    fn defects_morph_count() {
+        let doc = json!({
+            "nodes": [{"name": "DEF-a"}],
+            "skins": [{"joints": [0]}],
+            "meshes": [{
+                "name": "Face",
+                "weights": [0.0, 0.0],
+                "primitives": [{
+                    "attributes": {"POSITION": 0},
+                    "targets": [{"POSITION": 1}],
+                }],
+            }],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "type": "VEC3", "count": 5},
+                {"bufferView": 1, "componentType": 5126, "type": "VEC3", "count": 3},
+            ],
+            "bufferViews": [
+                {"byteOffset": 0, "byteLength": 60},
+                {"byteOffset": 60, "byteLength": 36},
+            ],
+            "buffers": [{"byteLength": 96}],
+        });
+        let r = check_glb(&pack_bin(&doc, &[0u8; 96]));
+        let found: Vec<&str> = r
+            .diags
+            .iter()
+            .filter(|d| d.code == "X_MORPH_COUNT")
+            .map(|d| d.detail.as_str())
+            .collect();
+        assert_eq!(found.len(), 2, "want both morph diags: {found:?}");
+        assert!(
+            found.iter().any(|d| d.contains("mesh.weights has 2")),
+            "no weights diag: {found:?}"
+        );
+        assert!(
+            found.iter().any(|d| d.contains("POSITION count 5")),
+            "no target-count diag: {found:?}"
+        );
+    }
+
+    #[test]
+    fn defects_morph_clean_passes() {
+        // Matching weights/targets, matching counts, and a weights-less
+        // primitive (defaults are zeros): all valid, all silent.
+        let doc = json!({
+            "nodes": [{"name": "DEF-a"}],
+            "skins": [{"joints": [0]}],
+            "meshes": [
+                {"name": "A", "weights": [0.5],
+                 "primitives": [{
+                     "attributes": {"POSITION": 0},
+                     "targets": [{"POSITION": 1}],
+                 }]},
+                {"name": "B",
+                 "primitives": [{
+                     "attributes": {"POSITION": 0},
+                     "targets": [{"POSITION": 1}],
+                 }]},
+            ],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "type": "VEC3", "count": 2},
+                {"bufferView": 1, "componentType": 5126, "type": "VEC3", "count": 2},
+            ],
+            "bufferViews": [
+                {"byteOffset": 0, "byteLength": 24},
+                {"byteOffset": 24, "byteLength": 24},
+            ],
+            "buffers": [{"byteLength": 48}],
+        });
+        let r = check_glb(&pack_bin(&doc, &[0u8; 48]));
+        assert!(r.diags.is_empty(), "unexpected: {:?}", diags_str(&r));
     }
 }

@@ -6,6 +6,7 @@
 //! DEF joints. See README.md.
 
 mod checks;
+mod defects;
 mod glb;
 mod weights;
 
