@@ -7,6 +7,7 @@
 //! out-of-bounds reads, sparse storage) is an explicit diagnostic,
 //! never a silent skip or a panic.
 
+use crate::util::{arr, as_idx, plural};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
@@ -18,25 +19,6 @@ pub const WEIGHT_TOL: f64 = 1e-3;
 pub struct SkinStats {
     pub max_influences: usize,
     pub checked_prims: usize,
-}
-
-fn arr<'a>(v: &'a Value, key: &str) -> &'a [Value] {
-    v.get(key)
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-}
-
-fn as_idx(v: &Value) -> Option<usize> {
-    v.as_u64().and_then(|n| usize::try_from(n).ok())
-}
-
-fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
-    if n == 1 {
-        one
-    } else {
-        many
-    }
 }
 
 pub(crate) struct Layout {

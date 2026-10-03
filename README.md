@@ -147,7 +147,9 @@ Class runs also enable convention checks (still WARN-level):
   `hair`, `ponytail`, or `braid` — get body weights via Data
   Transfer, so `P_PIECE_BONES` fires when a piece mesh uses a bone
   that carries no body weight. Piece-only files and unreadable
-  weights skip silently (nothing provable).
+  weights skip silently (nothing provable). Detection is by mesh
+  name alone, so this one also runs on unclassed budget runs
+  (`--mobile`, `--budget`).
 - Weapons (`--class weapon` only) attach to the hand bone in Godot
   (`BoneAttachment3D`): `P_WEAPON_SKIN` fires when the file carries
   a skin, `P_WEAPON_ATTACH` when no node is named `ATTACH-*` (the
@@ -170,7 +172,8 @@ still sound.
 `--budget <file>` overrides any subset of the defaults (missing
 keys keep mobile defaults; unknown keys are an error, so typos fail
 loudly). Format is sniffed from content — a leading `{` means JSON,
-anything else the TOML subset (`key = value` lines, `#` comments,
+anything else the TOML subset (`key = value` lines with unsigned
+integers — `50_000` digit separators allowed — `#` comments, and
 `[class.X]` sections):
 
 ```json

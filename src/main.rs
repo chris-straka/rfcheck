@@ -9,6 +9,7 @@ mod budget;
 mod checks;
 mod defects;
 mod glb;
+mod util;
 mod weights;
 
 use std::env;
@@ -113,28 +114,12 @@ fn main() -> ExitCode {
     let mut failed = false;
     for f in &files {
         let path = Path::new(f);
-        let bytes = match fs::read(path) {
-            Ok(b) => b,
-            Err(e) => {
-                let detail = format!("cannot read file: {e}");
-                if json_out {
-                    println!(
-                        "{{\"file\":\"{}\",\"ok\":false,\
-                         \"summary\":\"unreadable\",\
-                         \"diags\":[{{\"code\":\"R_IO\",\"detail\":\"{}\"}}]}}",
-                        path.display(),
-                        detail.replace('"', "'"),
-                    );
-                } else {
-                    println!("R_IO {}: {detail}", path.display());
-                }
-                failed = true;
-                continue;
-            }
-        };
-        let report = match &budgets {
-            Some(s) => checks::check_glb_with_class(&bytes, Some(s.for_class(class)), class),
-            None => checks::check_glb(&bytes),
+        let report = match fs::read(path) {
+            Err(e) => checks::Report::unreadable(format!("cannot read file: {e}"), class),
+            Ok(bytes) => match &budgets {
+                Some(s) => checks::check_glb_with_class(&bytes, Some(s.for_class(class)), class),
+                None => checks::check_glb(&bytes),
+            },
         };
         if json_out {
             println!("{}", report.to_json(path));

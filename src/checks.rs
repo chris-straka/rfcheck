@@ -4,6 +4,7 @@
 use crate::budget;
 use crate::defects;
 use crate::glb;
+use crate::util::{arr, join_names};
 use crate::weights;
 use serde_json::{json, Value};
 
@@ -24,6 +25,21 @@ pub struct Report {
 }
 
 impl Report {
+    /// The file could not be read at all (R_IO). Goes through the same
+    /// serializer as every other report, so odd paths (Windows `\`,
+    /// quotes) still yield valid JSON.
+    pub fn unreadable(detail: String, class: Option<budget::AssetClass>) -> Report {
+        Report {
+            diags: vec![Diag {
+                code: "R_IO",
+                detail,
+            }],
+            warns: None,
+            summary: "unreadable".to_string(),
+            class,
+        }
+    }
+
     pub fn failed(&self) -> bool {
         !self.diags.is_empty()
     }
@@ -61,27 +77,11 @@ impl Report {
     }
 }
 
-fn arr<'a>(v: &'a Value, key: &str) -> &'a [Value] {
-    v.get(key)
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-}
-
 fn node_name(nodes: &[Value], idx: usize) -> Option<&str> {
     nodes
         .get(idx)
         .and_then(|n| n.get("name"))
         .and_then(Value::as_str)
-}
-
-fn join_names(names: &[String]) -> String {
-    const CAP: usize = 5;
-    if names.len() <= CAP {
-        names.join(", ")
-    } else {
-        format!("{} (+{} more)", names[..CAP].join(", "), names.len() - CAP)
-    }
 }
 
 pub fn check_glb(bytes: &[u8]) -> Report {
@@ -278,6 +278,45 @@ mod tests {
         let len = b.len() as u32 + 100;
         b[8..12].copy_from_slice(&len.to_le_bytes());
         assert_eq!(codes(&check_glb(&b)), vec!["D_GLB_TRUNC"]);
+    }
+
+    #[test]
+    fn container_chunks_must_fit_declared_length() {
+        let doc = json!({"nodes": [{"name": "DEF-a"}], "skins": [{"joints": [0]}]});
+        // Declared length cuts into the JSON chunk.
+        let mut b = pack(&doc);
+        let short = (b.len() - 4) as u32;
+        b[8..12].copy_from_slice(&short.to_le_bytes());
+        assert_eq!(codes(&check_glb(&b)), vec!["D_GLB_TRUNC"]);
+        // Declared length drops the BIN chunk: a container defect, not
+        // a misleading W_BAD_ACCESSOR on an "empty" BIN.
+        let mut b = pack_bin(&doc, &[0u8; 8]);
+        let json_only = (b.len() - 16) as u32;
+        b[8..12].copy_from_slice(&json_only.to_le_bytes());
+        assert!(codes(&check_glb(&b)).is_empty(), "BIN-less prefix is valid");
+        let mut b = pack_bin(&doc, &[0u8; 8]);
+        let mid_bin = (b.len() - 4) as u32;
+        b[8..12].copy_from_slice(&mid_bin.to_le_bytes());
+        assert_eq!(codes(&check_glb(&b)), vec!["D_GLB_TRUNC"]);
+        // Trailing bytes past the declared length are ignored.
+        let mut b = pack(&doc);
+        b.extend_from_slice(b"junk");
+        assert!(codes(&check_glb(&b)).is_empty());
+    }
+
+    #[test]
+    fn unreadable_json_escapes_path() {
+        use budget::AssetClass::Hero;
+        let r = Report::unreadable("cannot read file: \"gone\"".to_string(), Some(Hero));
+        assert!(r.failed());
+        let p = Path::new("C:\\assets\\\"hero\".glb");
+        let v: Value = serde_json::from_str(&r.to_json(p)).expect("valid JSON");
+        assert_eq!(v["file"], "C:\\assets\\\"hero\".glb");
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["class"], "hero");
+        assert_eq!(v["diags"][0]["code"], "R_IO");
+        assert_eq!(v["diags"][0]["detail"], "cannot read file: \"gone\"");
+        assert!(v.get("warns").is_none());
     }
 
     #[test]
