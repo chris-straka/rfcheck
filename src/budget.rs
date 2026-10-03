@@ -11,6 +11,7 @@
 //! unreadable (dangling refs, foreign image codecs, external URIs) is
 //! skipped silently.
 
+use crate::util::{acc_count, arr, as_idx, as_usize, join_names, mesh_tag};
 use crate::weights::SkinStats;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -329,8 +330,10 @@ fn parse_toml_budget(text: &str) -> Result<FileBudget, String> {
     let mut section: Option<AssetClass> = None;
     for (ln, raw) in text.lines().enumerate() {
         let tag = format!("budget line {}", ln + 1);
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
+        // No strings in this subset, so `#` always starts a comment —
+        // on key lines and `[class.X]` headers alike.
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
             continue;
         }
         if line.starts_with('[') {
@@ -347,20 +350,26 @@ fn parse_toml_budget(text: &str) -> Result<FileBudget, String> {
             })?);
             continue;
         }
-        let (k, v) = raw
+        let (k, v) = line
             .split_once('=')
             .ok_or_else(|| format!("{tag}: expected key = value"))?;
         let key = k.trim();
-        let val = v.split('#').next().unwrap_or("").trim();
+        let val = v.trim();
         if key.is_empty() || val.is_empty() {
             return Err(format!("{tag}: expected key = value"));
         }
-        if !val.bytes().all(|c| c.is_ascii_digit()) {
+        // TOML digit separators: `50_000`, each `_` between two digits.
+        let digits_ok = val.bytes().all(|c| c.is_ascii_digit() || c == b'_')
+            && !val.starts_with('_')
+            && !val.ends_with('_')
+            && !val.contains("__");
+        if !digits_ok {
             return Err(format!(
                 "{tag}: value for '{key}' must be a non-negative integer"
             ));
         }
         let n: u64 = val
+            .replace('_', "")
             .parse()
             .map_err(|_| format!("{tag}: value for '{key}' overflows"))?;
         Budget::default()
@@ -391,40 +400,6 @@ pub fn load_budget_set(path: &Path) -> Result<BudgetSet, String> {
     parse_budget_set(&text)
 }
 
-fn arr<'a>(v: &'a Value, key: &str) -> &'a [Value] {
-    v.get(key)
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-}
-
-fn as_idx(v: &Value) -> Option<usize> {
-    v.as_u64().and_then(|n| usize::try_from(n).ok())
-}
-
-fn as_usize(v: &Value, key: &str) -> Option<usize> {
-    v.get(key)
-        .and_then(Value::as_u64)
-        .and_then(|n| usize::try_from(n).ok())
-}
-
-fn acc_count(json: &Value, ai: usize) -> Option<usize> {
-    arr(json, "accessors")
-        .get(ai)
-        .and_then(|a| as_usize(a, "count"))
-}
-
-fn mesh_tag(meshes: &[Value], mi: usize) -> String {
-    match meshes
-        .get(mi)
-        .and_then(|m| m.get("name"))
-        .and_then(Value::as_str)
-    {
-        Some(n) if !n.is_empty() => format!("mesh {mi} '{n}'"),
-        _ => format!("mesh {mi}"),
-    }
-}
-
 fn img_tag(images: &[Value], ii: usize) -> String {
     match images
         .get(ii)
@@ -442,15 +417,6 @@ fn class_tag(class: Option<AssetClass>) -> String {
     match class {
         Some(c) => format!("{} ", c.name()),
         None => String::new(),
-    }
-}
-
-fn join_names(names: &[String]) -> String {
-    const CAP: usize = 5;
-    if names.len() <= CAP {
-        names.join(", ")
-    } else {
-        format!("{} (+{} more)", names[..CAP].join(", "), names.len() - CAP)
     }
 }
 
@@ -924,6 +890,22 @@ mod tests {
         assert!(parse_budget("just words here").is_err());
         assert!(parse_budget("[budget]\nmax_tris_per_mesh = 5").is_err());
         assert!(parse_budget("max_tris_per_mesh = 99999999999999999999999").is_err());
+        assert!(parse_budget("max_tris_per_mesh = _5").is_err());
+        assert!(parse_budget("max_tris_per_mesh = 5_").is_err());
+        assert!(parse_budget("max_tris_per_mesh = 5__000").is_err());
+        assert!(parse_budget("max_tris_per_mesh = 5 000").is_err());
+    }
+
+    #[test]
+    fn toml_digit_separators_and_header_comments() {
+        let b = parse_budget("max_tris_per_mesh = 50_000\nmax_bones = 1_2_8 # odd but legal\n")
+            .unwrap();
+        assert_eq!(b.max_tris_per_mesh, 50_000);
+        assert_eq!(b.max_bones, 128);
+        let set = parse_budget_set("[class.hero] # player cast\nmax_bones = 100\n").unwrap();
+        assert_eq!(set.for_class(Some(AssetClass::Hero)).max_bones, 100);
+        assert_eq!(set.generic.max_bones, D_MAX_BONES);
+        assert!(parse_budget_set("[class.hero # comment eats the ]\nmax_bones = 1").is_err());
     }
 
     fn png(w: u32, h: u32) -> Vec<u8> {

@@ -9,42 +9,9 @@
 //! (dangling references, unknown component types, sparse storage)
 //! is skipped silently: this layer reports only what it can prove.
 
+use crate::util::{acc_count, arr, as_idx, as_usize, mesh_tag};
 use crate::weights;
 use serde_json::Value;
-
-fn arr<'a>(v: &'a Value, key: &str) -> &'a [Value] {
-    v.get(key)
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-}
-
-fn as_idx(v: &Value) -> Option<usize> {
-    v.as_u64().and_then(|n| usize::try_from(n).ok())
-}
-
-fn as_usize(v: &Value, key: &str) -> Option<usize> {
-    v.get(key)
-        .and_then(Value::as_u64)
-        .and_then(|n| usize::try_from(n).ok())
-}
-
-fn mesh_tag(meshes: &[Value], mi: usize) -> String {
-    match meshes
-        .get(mi)
-        .and_then(|m| m.get("name"))
-        .and_then(Value::as_str)
-    {
-        Some(n) if !n.is_empty() => format!("mesh {mi} '{n}'"),
-        _ => format!("mesh {mi}"),
-    }
-}
-
-fn acc_count(json: &Value, ai: usize) -> Option<usize> {
-    arr(json, "accessors")
-        .get(ai)
-        .and_then(|a| as_usize(a, "count"))
-}
 
 /// Every accessor's dense byte range must sit inside its
 /// bufferView, the declared buffer length, and the actual BIN chunk.

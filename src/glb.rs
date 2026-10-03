@@ -38,10 +38,18 @@ pub fn parse(bytes: &[u8]) -> Result<Document<'_>, (&'static str, String)> {
             format!("declared length {total} exceeds file size {}", bytes.len()),
         ));
     }
+    // Chunks must fit the declared length, not merely the file: a
+    // header that understates it would otherwise silently drop BIN.
+    let bytes = &bytes[..total];
     let at = 12usize;
     let chunk_len = match read_u32(bytes, at) {
         Some(v) => v as usize,
-        None => return Err(("D_GLB_JSON", "missing JSON chunk".to_string())),
+        None => {
+            return Err((
+                "D_GLB_JSON",
+                format!("missing JSON chunk (declared length {total})"),
+            ))
+        }
     };
     let chunk_type = read_u32(bytes, at + 4).unwrap_or(0);
     if chunk_type != CHUNK_JSON {
@@ -60,7 +68,7 @@ pub fn parse(bytes: &[u8]) -> Result<Document<'_>, (&'static str, String)> {
     if end > bytes.len() {
         return Err((
             "D_GLB_TRUNC",
-            "JSON chunk extends past end of file".to_string(),
+            format!("JSON chunk extends past declared length {total}"),
         ));
     }
     let json: Value = match serde_json::from_slice::<Value>(&bytes[start..end]) {
@@ -71,7 +79,12 @@ pub fn parse(bytes: &[u8]) -> Result<Document<'_>, (&'static str, String)> {
     if end < total {
         let blen = match read_u32(bytes, end) {
             Some(v) => v as usize,
-            None => return Err(("D_GLB_TRUNC", "BIN chunk header is truncated".to_string())),
+            None => {
+                return Err((
+                    "D_GLB_TRUNC",
+                    format!("BIN chunk header extends past declared length {total}"),
+                ))
+            }
         };
         let btype = read_u32(bytes, end + 4).unwrap_or(0);
         let bstart = end + 8;
@@ -82,7 +95,7 @@ pub fn parse(bytes: &[u8]) -> Result<Document<'_>, (&'static str, String)> {
         if bend > bytes.len() {
             return Err((
                 "D_GLB_TRUNC",
-                "BIN chunk extends past end of file".to_string(),
+                format!("BIN chunk extends past declared length {total}"),
             ));
         }
         // Unknown second-chunk types are ignored (forward-compatible);
