@@ -4,7 +4,7 @@
 use crate::budget;
 use crate::defects;
 use crate::glb;
-use crate::util::{arr, join_names};
+use crate::util::{arr, join_names, plural};
 use crate::weights;
 use serde_json::{json, Value};
 
@@ -226,7 +226,10 @@ pub fn check_glb_with_class(
     }
     if let Some(w) = &warns {
         if !w.is_empty() {
-            summary.push_str(&format!(", {} over budget", w.len()));
+            // Not "over budget": P_TEX_NORMAL / P_WEAPON_* / P_PIECE_BONES
+            // are convention warnings with no budget behind them.
+            let n = w.len();
+            summary.push_str(&format!(", {n} {}", plural(n, "warning", "warnings")));
         }
     }
     Report {
@@ -992,7 +995,7 @@ mod tests {
         let t = warn_for(&r, "P_TRIS").unwrap();
         assert!(t.contains("100001 tris"), "no count: {t}");
         assert!(
-            r.summary.ends_with(", 2 over budget"),
+            r.summary.ends_with(", 2 warnings"),
             "summary: {}",
             r.summary
         );
@@ -1007,7 +1010,7 @@ mod tests {
         let r = check_glb_with_budget(&pack_bin(&doc, &bin), Some(&budget::Budget::default()));
         assert!(r.diags.is_empty(), "unexpected: {:?}", diags_str(&r));
         assert!(r.warnings().is_empty());
-        assert!(!r.summary.contains("over budget"), "summary: {}", r.summary);
+        assert!(!r.summary.contains("warning"), "summary: {}", r.summary);
         // Budgets ran (empty warns array proves it), file is clean.
         let j: Value = serde_json::from_str(&r.to_json(Path::new("ok.glb"))).unwrap();
         assert_eq!(j["warns"], json!([]));
@@ -1245,6 +1248,7 @@ mod tests {
         let d = warn_for(&r, "P_TEX_NORMAL").expect("hero needs P_TEX_NORMAL");
         assert!(d.contains("normalTexture"), "detail: {d}");
         assert!(r.diags.is_empty(), "warn only: {:?}", diags_str(&r));
+        assert!(r.summary.ends_with(", 1 warning"), "summary: {}", r.summary);
         let r = classed(&pack(&bare), Npc);
         assert!(warn_for(&r, "P_TEX_NORMAL").is_some());
         // Props, weapons, and unclassed runs skip (nothing provable).

@@ -226,6 +226,12 @@ errors.
   class), bone budget (`P_BONES`), normal-map (`P_TEX_NORMAL`),
   piece (`P_PIECE_BONES`), and weapon (`P_WEAPON_SKIN`,
   `P_WEAPON_ATTACH`) warnings; prop/weapon runs may be unrigged.
+- v0.5.1: fixes — `--json` stays valid JSON for unreadable paths
+  with `\` or `"`; budget TOML takes `50_000` and comments after
+  `[class.X]`; GLB chunks must fit the header's declared length
+  (`D_GLB_TRUNC`, previously a misleading `W_BAD_ACCESSOR`); the
+  summary counts budget-run findings as `N warnings` (was
+  `N over budget`, which miscounted convention warnings).
 - HLL CI wiring: done — `validate_assets.py` shells out for inbound
   character/creature GLBs, and HLL's CI installs rfcheck via cargo.
 
