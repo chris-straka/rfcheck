@@ -1212,13 +1212,13 @@ mod tests {
     #[test]
     fn class_bones_count_def_only() {
         use budget::AssetClass::Hero;
-        // 130 deform bones over the 128 hero ceiling; 5 control
+        // 162 deform bones over the 160 hero ceiling; 5 control
         // joints fail the contract but do not join the bone count.
-        let r = classed(&pack(&joints_doc(130, 5)), Hero);
+        let r = classed(&pack(&joints_doc(162, 5)), Hero);
         assert!(codes(&r).contains(&"R_JOINT_PREFIX"));
         let d = warn_for(&r, "P_BONES").expect("missing P_BONES");
-        assert!(d.contains("130 deform bones"), "no count: {d}");
-        assert!(d.contains("128 hero budget"), "no budget: {d}");
+        assert!(d.contains("162 deform bones"), "no count: {d}");
+        assert!(d.contains("160 hero budget"), "no budget: {d}");
         // The R_* fails; the P_* only warns.
         assert!(r.failed());
         // Small rig under every ceiling stays silent.

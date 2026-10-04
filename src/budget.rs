@@ -117,8 +117,8 @@ impl Default for Budget {
 impl Budget {
     /// Mobile-profile budget for one asset class: HLL art direction
     /// (heroes 5k-15k tris, 512-1024 px textures) tightened for
-    /// phone-class GPUs. NPCs wrap the hero base today, so they share
-    /// its bone budget until the lighter mobile rig lands; monsters
+    /// phone-class GPUs. Heroes allow the full 160-bone rigforge rig;
+    /// NPCs keep 128 until the lighter mobile rig lands; monsters
     /// may exceed heroes (one large boss draw, not a crowd); props
     /// and weapons are small static draws.
     pub fn mobile_for(class: AssetClass) -> Self {
@@ -128,7 +128,7 @@ impl Budget {
                 max_verts_per_mesh: 10_000,
                 max_texture_dim: 1024,
                 max_influences: 4,
-                max_bones: 128,
+                max_bones: 160,
             },
             AssetClass::Npc => Budget {
                 max_tris_per_mesh: 8_000,
@@ -993,7 +993,7 @@ mod tests {
         use AssetClass::*;
         assert_eq!(
             ceilings(&Budget::mobile_for(Hero)),
-            (15_000, 10_000, 1024, 4, 128)
+            (15_000, 10_000, 1024, 4, 160)
         );
         assert_eq!(
             ceilings(&Budget::mobile_for(Npc)),

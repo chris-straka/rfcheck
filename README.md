@@ -128,15 +128,16 @@ only for classed runs). `--class` implies budget checks, like
 
 | Class | Tris | Verts | Tex px | Infl | Bones |
 | --- | --- | --- | --- | --- | --- |
-| `hero` | 15,000 | 10,000 | 1024 | 4 | 128 |
+| `hero` | 15,000 | 10,000 | 1024 | 4 | 160 |
 | `npc` | 8,000 | 6,000 | 512 | 4 | 128 |
 | `monster` | 20,000 | 12,000 | 1024 | 4 | 128 |
 | `prop` | 2,000 | 1,500 | 512 | 4 | 64 |
 | `weapon` | 2,000 | 1,500 | 512 | 4 | 16 |
 
-Heroes follow HLL art direction (5k–15k tris, 512–1024 px textures);
-NPCs wrap the hero base today so they share its bone budget until
-the lighter mobile rig lands; monsters may exceed heroes (one large
+Heroes follow HLL art direction (5k–15k tris, 512–1024 px textures)
+and allow 160 deform bones, the full rigforge hero rig with face, fingers
+and twists (owner decision, 2026-10-04); NPCs stay at 128 until the
+lighter mobile rig lands; monsters may exceed heroes (one large
 boss draw, not a crowd); props and weapons are small static draws.
 
 Class runs also enable convention checks (still WARN-level):

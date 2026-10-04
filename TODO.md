@@ -15,6 +15,8 @@
       Done v0.5.0: `max_bones` (generic 256, hero/npc/monster 128)
       counting unique DEF-* joints; the 160-bone hero warns until
       the lighter rigforge mobile profile lands.
+      2026-10-04: hero raised to 160 (owner), so the full rigforge
+      hero rig passes; npc/monster stay 128.
 - [x] Piece checks: capes/hair skinned to body bones only; weapons have
       no skin and a named attachment point.
       Done v0.5.0: `P_PIECE_BONES` (piece-joint subset of body
