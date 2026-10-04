@@ -1,5 +1,5 @@
 
-## Requested 2026-10-01 (see ~/Games/tools/roadmap.md)
+## Requested 2026-10-01 (see ~/SWE/games/tools/roadmap.md)
 
 - [x] Mesh budget per asset class (hero 5k-15k tris, NPC, monster, prop)
       from the budget TOML, with a mobile profile.
