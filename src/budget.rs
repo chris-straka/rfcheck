@@ -639,7 +639,7 @@ fn deform_bone_count(json: &Value) -> usize {
                     .get(i)
                     .and_then(|n| n.get("name"))
                     .and_then(Value::as_str)
-                    .is_some_and(|n| n.starts_with("DEF-"))
+                    .is_some_and(glbkit::rig::is_deform_bone)
             });
             if is_def {
                 seen.insert(idx.unwrap_or(usize::MAX));
@@ -704,12 +704,8 @@ fn check_normal_map(
 /// over all other skinned meshes. Piece-only files, unskinned
 /// pieces, and unreadable weights skip silently (nothing provable;
 /// the weight layer owns malformed reads).
-const PIECE_WORDS: &[&str] = &["cape", "cloak", "hair", "ponytail", "braid"];
-
 fn is_piece_mesh(mesh: &Value) -> bool {
-    let name = mesh.get("name").and_then(Value::as_str).unwrap_or("");
-    let lower = name.to_lowercase();
-    PIECE_WORDS.iter().any(|w| lower.contains(w))
+    glbkit::rig::is_piece_name(mesh.get("name").and_then(Value::as_str).unwrap_or(""))
 }
 
 fn check_pieces(json: &Value, bin: &[u8], out: &mut Vec<(&'static str, String)>) {

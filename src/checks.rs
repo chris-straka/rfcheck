@@ -149,7 +149,7 @@ pub fn check_glb_with_class(
     }
     let mut non_def: Vec<String> = joints
         .iter()
-        .filter(|n| !n.starts_with("DEF-"))
+        .filter(|n| !glbkit::rig::is_deform_bone(n))
         .cloned()
         .collect();
     non_def.sort();
@@ -177,7 +177,7 @@ pub fn check_glb_with_class(
                     .and_then(|i| node_name(nodes, i))
                     .map(str::to_string);
                 match name {
-                    Some(n) if n.starts_with("DEF-") => {}
+                    Some(n) if glbkit::rig::is_deform_bone(&n) => {}
                     Some(n) => bad.push(n),
                     None => bad.push("<missing node>".to_string()),
                 }

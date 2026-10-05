@@ -11,33 +11,14 @@ use crate::util::{arr, as_idx, plural};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
-/// Game-rig limit: at most 4 nonzero influences per vertex.
-pub const MAX_INFLUENCES: usize = 4;
-/// Weight sums must land within this distance of 1.0.
-pub const WEIGHT_TOL: f64 = 1e-3;
+pub use glbkit::rig::{MAX_INFLUENCES, WEIGHT_TOL};
 
 pub struct SkinStats {
     pub max_influences: usize,
     pub checked_prims: usize,
 }
 
-pub(crate) struct Layout {
-    pub(crate) base: usize,
-    pub(crate) stride: usize,
-    pub(crate) count: usize,
-    pub(crate) comp: u32,
-    pub(crate) ncomp: usize,
-    pub(crate) normalized: bool,
-}
-
-pub(crate) fn comp_size(comp: u32) -> Option<usize> {
-    match comp {
-        5120 | 5121 => Some(1),
-        5122 | 5123 => Some(2),
-        5125 | 5126 => Some(4),
-        _ => None,
-    }
-}
+pub(crate) use glbkit::accessor::{Component, Layout};
 
 /// Resolve an accessor to its BIN layout, bounds-checked. `what` names
 /// the attribute for error detail (e.g. "WEIGHTS_0").
@@ -47,6 +28,7 @@ pub(crate) fn layout_of(
     ai: usize,
     what: &str,
 ) -> Result<Layout, String> {
+    use glbkit::accessor::{Desc, LayoutError, View};
     let acc = arr(json, "accessors")
         .get(ai)
         .ok_or_else(|| format!("{what} accessor {ai} is out of range"))?;
@@ -57,123 +39,81 @@ pub(crate) fn layout_of(
     let bv = arr(json, "bufferViews")
         .get(bvi)
         .ok_or_else(|| format!("{what} accessor {ai} references missing bufferView {bvi}"))?;
-    if bv.get("buffer").and_then(Value::as_u64).unwrap_or(0) != 0 {
-        return Err(format!("{what} accessor {ai} uses a non-GLB buffer"));
-    }
-    let comp = acc
-        .get("componentType")
-        .and_then(Value::as_u64)
-        .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(0);
-    let csz =
-        comp_size(comp).ok_or_else(|| format!("{what} accessor {ai} has componentType {comp}"))?;
-    let ncomp = match acc.get("type").and_then(Value::as_str).unwrap_or("") {
-        "SCALAR" => 1,
-        "VEC2" => 2,
-        "VEC3" => 3,
-        "VEC4" => 4,
-        other => return Err(format!("{what} accessor {ai} has type {other:?}")),
+    let num = |v: &Value, k: &str| v.get(k).and_then(as_idx);
+    let byte_offset = num(bv, "byteOffset").unwrap_or(0);
+    let view = View {
+        buffer: num(bv, "buffer").unwrap_or(0),
+        byte_offset,
+        // byteLength is required; when absent, X_ACCESSOR_BOUNDS skips the
+        // view and reads stay bounded by BIN alone.
+        byte_length: num(bv, "byteLength").unwrap_or(bin_len.saturating_sub(byte_offset)),
+        byte_stride: num(bv, "byteStride"),
     };
-    let elem = csz * ncomp;
-    let stride = bv
-        .get("byteStride")
-        .and_then(Value::as_u64)
-        .and_then(|n| usize::try_from(n).ok())
-        .unwrap_or(elem);
-    if stride < elem {
-        return Err(format!(
-            "{what} accessor {ai} has byteStride {stride} below element size {elem}"
-        ));
-    }
-    let count = acc
-        .get("count")
-        .and_then(Value::as_u64)
-        .and_then(|n| usize::try_from(n).ok())
-        .unwrap_or(0);
-    let off = |v: &Value, k: &str| {
-        v.get(k)
+    let desc = Desc {
+        count: num(acc, "count").unwrap_or(0),
+        component_type: acc
+            .get("componentType")
             .and_then(Value::as_u64)
-            .and_then(|n| usize::try_from(n).ok())
-            .unwrap_or(0)
-    };
-    let base = off(bv, "byteOffset")
-        .checked_add(off(acc, "byteOffset"))
-        .ok_or_else(|| format!("{what} accessor {ai} has overflowing offsets"))?;
-    let end = if count == 0 {
-        base
-    } else {
-        base.checked_add(
-            count
-                .saturating_sub(1)
-                .checked_mul(stride)
-                .ok_or_else(|| format!("{what} accessor {ai} extent overflows"))?,
-        )
-        .and_then(|v| v.checked_add(elem))
-        .ok_or_else(|| format!("{what} accessor {ai} extent overflows"))?
-    };
-    if base > bin_len || end > bin_len {
-        return Err(format!(
-            "{what} accessor {ai} reads past the BIN chunk ({end} > {bin_len})"
-        ));
-    }
-    Ok(Layout {
-        base,
-        stride,
-        count,
-        comp,
-        ncomp,
+            .unwrap_or(0),
+        kind: acc.get("type").and_then(Value::as_str).unwrap_or(""),
         normalized: acc
             .get("normalized")
             .and_then(Value::as_bool)
             .unwrap_or(false),
-    })
+        byte_offset: num(acc, "byteOffset").unwrap_or(0),
+        view: Some(view),
+    };
+    let lay = Layout::resolve(&desc, bin_len).map_err(|e| match e {
+        LayoutError::ExternalBuffer(_) => format!("{what} accessor {ai} uses a non-GLB buffer"),
+        LayoutError::BadComponent(c) => format!("{what} accessor {ai} has componentType {c}"),
+        LayoutError::Overflow => format!("{what} accessor {ai} extent overflows"),
+        LayoutError::ViewPastBin { end, bin_len } => {
+            format!("{what} accessor {ai} reads past the BIN chunk ({end} > {bin_len})")
+        }
+        LayoutError::PastView { end, view_end } => {
+            format!("{what} accessor {ai} reads past bufferView {bvi} ({end} > {view_end})")
+        }
+        e => format!("{what} accessor {ai} has {e}"),
+    })?;
+    if lay.width > 4 {
+        return Err(format!("{what} accessor {ai} has type {:?}", desc.kind));
+    }
+    Ok(lay)
 }
 
 /// Read one weight value with normalized-int conversion. Fully
 /// bounds-checked; None means the layout lied (cannot happen after
 /// `layout_of`, but corrupt input must never panic).
 fn weight_at(bin: &[u8], lay: &Layout, v: usize, k: usize) -> Option<f64> {
-    let csz = comp_size(lay.comp)?;
-    let o = lay
-        .base
-        .checked_add(v.checked_mul(lay.stride)?)?
-        .checked_add(k.checked_mul(csz)?)?;
-    match lay.comp {
-        5126 => Some(f32::from_le_bytes(bin.get(o..o + 4)?.try_into().ok()?) as f64),
-        5121 => Some(f64::from(*bin.get(o)?) / 255.0),
-        5123 => Some(f64::from(u16::from_le_bytes(bin.get(o..o + 2)?.try_into().ok()?)) / 65535.0),
-        _ => None,
-    }
+    lay.read_weight(bin, v, k)
 }
 
 /// Raw f32 read (FLOAT accessors only). Bounds-checked; None on
 /// any mismatch, so corrupt input can never panic.
 pub(crate) fn f32_at(bin: &[u8], lay: &Layout, v: usize, k: usize) -> Option<f32> {
-    if lay.comp != 5126 {
-        return None;
-    }
-    let o = lay
-        .base
-        .checked_add(v.checked_mul(lay.stride)?)?
-        .checked_add(k.checked_mul(4)?)?;
-    Some(f32::from_le_bytes(bin.get(o..o + 4)?.try_into().ok()?))
+    lay.read_f32(bin, v, k)
 }
 
 /// Raw joint-index read (UNSIGNED_BYTE/SHORT accessors only).
 /// Bounds-checked; None on any mismatch.
 pub(crate) fn uint_at(bin: &[u8], lay: &Layout, v: usize, k: usize) -> Option<u32> {
-    let csz = comp_size(lay.comp)?;
-    let o = lay
-        .base
-        .checked_add(v.checked_mul(lay.stride)?)?
-        .checked_add(k.checked_mul(csz)?)?;
-    match lay.comp {
-        5121 => Some(u32::from(*bin.get(o)?)),
-        5123 => Some(u32::from(u16::from_le_bytes(
-            bin.get(o..o + 2)?.try_into().ok()?,
-        ))),
+    match lay.component {
+        Component::U8 | Component::U16 => lay.read_uint(bin, v, k),
         _ => None,
     }
+}
+
+/// True for the JOINTS_n storage the spec allows: VEC4 UBYTE/USHORT.
+fn joints_ok(lay: &Layout) -> bool {
+    lay.width == 4 && matches!(lay.component, Component::U8 | Component::U16)
+}
+
+/// True for the WEIGHTS_n storage the spec allows: VEC4 FLOAT, or
+/// normalized UBYTE/USHORT.
+fn weights_ok(lay: &Layout) -> bool {
+    lay.width == 4
+        && (lay.component == Component::F32
+            || (lay.normalized && matches!(lay.component, Component::U8 | Component::U16)))
 }
 
 pub fn check_weights(json: &Value, bin: &[u8]) -> (Vec<(&'static str, String)>, SkinStats) {
@@ -267,7 +207,7 @@ pub fn check_weights(json: &Value, bin: &[u8]) -> (Vec<(&'static str, String)>, 
                         break;
                     }
                 };
-                if jl.ncomp != 4 || (jl.comp != 5121 && jl.comp != 5123) {
+                if !joints_ok(&jl) {
                     out.push((
                         "W_BAD_ACCESSOR",
                         format!("{ptag}: {jt} accessor {j} must be VEC4 UNSIGNED_BYTE/SHORT"),
@@ -275,8 +215,7 @@ pub fn check_weights(json: &Value, bin: &[u8]) -> (Vec<(&'static str, String)>, 
                     skipped = true;
                     break;
                 }
-                let w_ok = wl.ncomp == 4
-                    && (wl.comp == 5126 || (wl.normalized && (wl.comp == 5121 || wl.comp == 5123)));
+                let w_ok = weights_ok(&wl);
                 if !w_ok {
                     out.push((
                         "W_BAD_ACCESSOR",
@@ -439,11 +378,10 @@ pub(crate) fn used_nodes(json: &Value, bin: &[u8], mi: usize) -> Option<BTreeSet
             ) else {
                 return None;
             };
-            if jl.ncomp != 4 || (jl.comp != 5121 && jl.comp != 5123) {
+            if !joints_ok(&jl) {
                 return None;
             }
-            let w_ok = wl.ncomp == 4
-                && (wl.comp == 5126 || (wl.normalized && (wl.comp == 5121 || wl.comp == 5123)));
+            let w_ok = weights_ok(&wl);
             if !w_ok {
                 return None;
             }

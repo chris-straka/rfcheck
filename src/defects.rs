@@ -11,6 +11,7 @@
 
 use crate::util::{acc_count, arr, as_idx, as_usize, mesh_tag};
 use crate::weights;
+use glbkit::accessor::{type_width, Component};
 use serde_json::Value;
 
 /// Every accessor's dense byte range must sit inside its
@@ -29,20 +30,16 @@ fn check_bounds(json: &Value, bin: &[u8], out: &mut Vec<(&'static str, String)>)
             Some(v) => v,
             None => continue,
         };
-        let comp = acc
+        let csz = match acc
             .get("componentType")
             .and_then(Value::as_u64)
-            .and_then(|n| u32::try_from(n).ok())
-            .unwrap_or(0);
-        let csz = match weights::comp_size(comp) {
-            Some(s) => s,
+            .and_then(Component::from_gl)
+        {
+            Some(c) => c.size(),
             None => continue,
         };
-        let ncomp = match acc.get("type").and_then(Value::as_str).unwrap_or("") {
-            "SCALAR" => 1,
-            "VEC2" => 2,
-            "VEC3" => 3,
-            "VEC4" => 4,
+        let ncomp = match acc.get("type").and_then(Value::as_str).and_then(type_width) {
+            Some(n) if n <= 4 => n,
             _ => continue,
         };
         let elem = csz * ncomp;
@@ -188,7 +185,7 @@ fn check_anims(json: &Value, bin: &[u8], out: &mut Vec<(&'static str, String)>) 
             let mut total = 0usize;
             let mut readable = true;
             for v in 0..lay.count {
-                for k in 0..lay.ncomp {
+                for k in 0..lay.width {
                     match weights::f32_at(bin, &lay, v, k) {
                         Some(x) => {
                             if !x.is_finite() {
@@ -261,7 +258,7 @@ fn check_joint_range(json: &Value, bin: &[u8], out: &mut Vec<(&'static str, Stri
                     Ok(l) => l,
                     Err(_) => continue,
                 };
-                if lay.ncomp != 4 || (lay.comp != 5121 && lay.comp != 5123) {
+                if lay.width != 4 || !matches!(lay.component, Component::U8 | Component::U16) {
                     continue;
                 }
                 let mut bad = 0usize;
