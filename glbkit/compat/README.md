@@ -7,7 +7,7 @@ load in the tools the games use, and that Blender's own GLBs read back.
 
 ```sh
 cd glbkit/compat/bevy
-cargo run --release -- a.glb b.glb ...
+cargo run --release --example check -- a.glb b.glb ...
 ```
 
 Loads each file through Bevy 0.19.1's glTF loader (same pin as hll-bevy),

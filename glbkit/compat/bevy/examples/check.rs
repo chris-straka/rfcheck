@@ -1,4 +1,4 @@
-//! `glbkit-bevy-compat a.glb b.glb ...`: load each GLB through Bevy's own
+//! `cargo run --release --example check -- a.glb b.glb ...`: load each GLB through Bevy's own
 //! glTF loader (headless, no GPU, no window), spawn its default scene, and
 //! report what Bevy built. Exit 1 if any file fails to load, has a mesh
 //! without positions, or declares skins that never become `SkinnedMesh`
@@ -20,7 +20,7 @@ const MAX_UPDATES: usize = 2000;
 fn main() {
     let files: Vec<String> = std::env::args().skip(1).collect();
     if files.is_empty() {
-        eprintln!("usage: glbkit-bevy-compat <file.glb>...");
+        eprintln!("usage: cargo run --release --example check -- <file.glb>...");
         std::process::exit(2);
     }
     let mut failed = 0;
