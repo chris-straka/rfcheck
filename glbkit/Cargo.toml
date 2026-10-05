@@ -1,0 +1,9 @@
+[package]
+name = "glbkit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "GLB container + accessor IO and the rig contract shared by rfcheck, weightforge, and wrapforge"
+
+# No dependencies, on purpose: every consumer brings its own JSON layer.
+[dependencies]

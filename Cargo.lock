@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "glbkit"
+version = "0.1.0"
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -36,6 +40,7 @@ dependencies = [
 name = "rfcheck"
 version = "0.5.1"
 dependencies = [
+ "glbkit",
  "serde",
  "serde_json",
 ]
