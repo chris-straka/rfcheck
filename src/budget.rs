@@ -32,9 +32,9 @@ pub const D_MAX_TEXTURE_DIM: u32 = 2048;
 /// standard (Adreno/Xclipse/Mali handle it natively). Tighten via
 /// --budget for low-end targets.
 pub const D_MAX_INFLUENCES: usize = 4;
-/// Loose generic ceiling: 256 matrices x 64 B = 16 KB, exactly the
-/// guaranteed UBO size — anything past this cannot upload its palette
-/// everywhere. Per-class mobile budgets sit well below (see
+/// Loose generic ceiling: Bevy's `MAX_JOINTS` (256 matrices x 64 B =
+/// 16 KB, the guaranteed UBO size) — past this a skin's palette cannot
+/// upload on the uniform-buffer path. Per-class mobile budgets sit well below (see
 /// `Budget::mobile_for`).
 pub const D_MAX_BONES: usize = 256;
 
@@ -51,9 +51,10 @@ pub enum AssetClass {
     Monster,
     Prop,
     Weapon,
+    Level,
 }
 
-pub const CLASS_NAMES: &str = "hero, npc, monster, prop, weapon";
+pub const CLASS_NAMES: &str = "hero, npc, monster, prop, weapon, level";
 
 pub fn parse_class(name: &str) -> Option<AssetClass> {
     match name {
@@ -62,6 +63,7 @@ pub fn parse_class(name: &str) -> Option<AssetClass> {
         "monster" => Some(AssetClass::Monster),
         "prop" => Some(AssetClass::Prop),
         "weapon" => Some(AssetClass::Weapon),
+        "level" => Some(AssetClass::Level),
         _ => None,
     }
 }
@@ -74,6 +76,7 @@ impl AssetClass {
             AssetClass::Monster => "monster",
             AssetClass::Prop => "prop",
             AssetClass::Weapon => "weapon",
+            AssetClass::Level => "level",
         }
     }
 
@@ -85,10 +88,13 @@ impl AssetClass {
         )
     }
 
-    /// Props and weapons are legitimately unrigged; characters must
-    /// carry a skeleton (the rig contract's R_NO_SKIN).
+    /// Props, weapons, and levels are legitimately unrigged; characters
+    /// must carry a skeleton (the rig contract's R_NO_SKIN).
     pub fn needs_skeleton(self) -> bool {
-        !matches!(self, AssetClass::Prop | AssetClass::Weapon)
+        !matches!(
+            self,
+            AssetClass::Prop | AssetClass::Weapon | AssetClass::Level
+        )
     }
 }
 
@@ -118,7 +124,8 @@ impl Budget {
     /// Mobile-profile budget for one asset class: HLL art direction
     /// (heroes 5k-15k tris, 512-1024 px textures) tightened for
     /// phone-class GPUs. Heroes allow the full 160-bone rigforge rig;
-    /// NPCs keep 128 until the lighter mobile rig lands; monsters
+    /// NPCs get rigforge's MOBILE profile (65 deform bones: no face,
+    /// no twists); monsters
     /// may exceed heroes (one large boss draw, not a crowd); props
     /// and weapons are small static draws.
     pub fn mobile_for(class: AssetClass) -> Self {
@@ -135,7 +142,7 @@ impl Budget {
                 max_verts_per_mesh: 6_000,
                 max_texture_dim: 512,
                 max_influences: 4,
-                max_bones: 128,
+                max_bones: 65,
             },
             AssetClass::Monster => Budget {
                 max_tris_per_mesh: 20_000,
@@ -158,6 +165,9 @@ impl Budget {
                 max_influences: 4,
                 max_bones: 16,
             },
+            // Levels are many meshes: the per-mesh flagship ceilings
+            // (one draw each), not a prop's.
+            AssetClass::Level => Budget::default(),
         }
     }
 
@@ -205,6 +215,7 @@ pub struct BudgetSet {
     monster: Budget,
     prop: Budget,
     weapon: Budget,
+    level: Budget,
 }
 
 impl BudgetSet {
@@ -216,6 +227,7 @@ impl BudgetSet {
             monster: Budget::mobile_for(AssetClass::Monster),
             prop: Budget::mobile_for(AssetClass::Prop),
             weapon: Budget::mobile_for(AssetClass::Weapon),
+            level: Budget::mobile_for(AssetClass::Level),
         }
     }
 
@@ -227,6 +239,7 @@ impl BudgetSet {
             Some(AssetClass::Monster) => &self.monster,
             Some(AssetClass::Prop) => &self.prop,
             Some(AssetClass::Weapon) => &self.weapon,
+            Some(AssetClass::Level) => &self.level,
         }
     }
 
@@ -237,6 +250,7 @@ impl BudgetSet {
             AssetClass::Monster => &mut self.monster,
             AssetClass::Prop => &mut self.prop,
             AssetClass::Weapon => &mut self.weapon,
+            AssetClass::Level => &mut self.level,
         }
     }
 }
@@ -262,6 +276,7 @@ impl FileBudget {
             AssetClass::Monster,
             AssetClass::Prop,
             AssetClass::Weapon,
+            AssetClass::Level,
         ] {
             for (k, n) in &self.top {
                 set.class_mut(c).set(k, *n)?;
@@ -508,6 +523,49 @@ fn image_bytes<'a>(json: &Value, bin: &'a [u8], bvi: usize) -> Option<&'a [u8]> 
     bin.get(off..off.checked_add(len)?)
 }
 
+struct MeshCounts {
+    verts: usize,
+    v_unknown: usize,
+    tris: usize,
+    t_unknown: usize,
+}
+
+fn mesh_counts(json: &Value, mesh: &Value) -> MeshCounts {
+    let mut c = MeshCounts {
+        verts: 0,
+        v_unknown: 0,
+        tris: 0,
+        t_unknown: 0,
+    };
+    for prim in arr(mesh, "primitives") {
+        let mode = prim.get("mode").and_then(Value::as_u64).unwrap_or(4);
+        let vcount = prim
+            .get("attributes")
+            .and_then(|a| a.get("POSITION"))
+            .and_then(as_idx)
+            .and_then(|ai| acc_count(json, ai));
+        match vcount {
+            Some(v) => c.verts = c.verts.saturating_add(v),
+            None => c.v_unknown += 1,
+        }
+        if mode != 4 {
+            continue;
+        }
+        match prim
+            .get("indices")
+            .and_then(as_idx)
+            .and_then(|ai| acc_count(json, ai))
+        {
+            Some(ic) => c.tris = c.tris.saturating_add(ic / 3),
+            None => match vcount {
+                Some(v) => c.tris = c.tris.saturating_add(v / 3),
+                None => c.t_unknown += 1,
+            },
+        }
+    }
+    c
+}
+
 /// Per-mesh verts (POSITION counts) and tris (indexed count/3, else
 /// verts/3 for triangle lists). Non-triangle modes carry no
 /// triangle-list cost and are excluded from tris; prims whose counts
@@ -522,36 +580,12 @@ fn check_meshes(
 ) {
     for (mi, mesh) in arr(json, "meshes").iter().enumerate() {
         let mtag = mesh_tag(arr(json, "meshes"), mi);
-        let mut verts = 0usize;
-        let mut v_unknown = 0usize;
-        let mut tris = 0usize;
-        let mut t_unknown = 0usize;
-        for prim in arr(mesh, "primitives") {
-            let mode = prim.get("mode").and_then(Value::as_u64).unwrap_or(4);
-            let vcount = prim
-                .get("attributes")
-                .and_then(|a| a.get("POSITION"))
-                .and_then(as_idx)
-                .and_then(|ai| acc_count(json, ai));
-            match vcount {
-                Some(v) => verts = verts.saturating_add(v),
-                None => v_unknown += 1,
-            }
-            if mode != 4 {
-                continue;
-            }
-            match prim
-                .get("indices")
-                .and_then(as_idx)
-                .and_then(|ai| acc_count(json, ai))
-            {
-                Some(ic) => tris = tris.saturating_add(ic / 3),
-                None => match vcount {
-                    Some(v) => tris = tris.saturating_add(v / 3),
-                    None => t_unknown += 1,
-                },
-            }
-        }
+        let MeshCounts {
+            verts,
+            v_unknown,
+            tris,
+            t_unknown,
+        } = mesh_counts(json, mesh);
         let note = |u: usize| {
             if u == 0 {
                 String::new()
@@ -755,10 +789,11 @@ fn check_pieces(json: &Value, bin: &[u8], out: &mut Vec<(&'static str, String)>)
     }
 }
 
-/// Weapons attach to the hand bone in Godot (`BoneAttachment3D`):
-/// the file carries no skin, and a node named `ATTACH-*` marks the
-/// grip point the importer snaps to the hand. Class-gated: only a
-/// `--class weapon` run knows the file is a weapon.
+/// Weapons hang off a hand socket on the character (HLL snaps them to
+/// `Socket_Hand_R` every frame): the weapon file carries no skin, and
+/// its origin is the grip. Class-gated: only a `--class weapon` run
+/// knows the file is a weapon. (The Godot-era `ATTACH-*` grip node,
+/// `P_WEAPON_ATTACH`, is gone with Godot.)
 fn check_weapon(json: &Value, class: Option<AssetClass>, out: &mut Vec<(&'static str, String)>) {
     if class != Some(AssetClass::Weapon) {
         return;
@@ -768,21 +803,116 @@ fn check_weapon(json: &Value, class: Option<AssetClass>, out: &mut Vec<(&'static
         out.push((
             "P_WEAPON_SKIN",
             format!(
-                "{n} skin{} (weapons attach, never skin)",
+                "{n} skin{} (weapons attach to a socket, never skin)",
                 if n == 1 { "" } else { "s" },
             ),
         ));
     }
-    let has_attach = arr(json, "nodes").iter().any(|nd| {
-        nd.get("name")
-            .and_then(Value::as_str)
-            .is_some_and(|nm| nm.starts_with("ATTACH-"))
-    });
-    if !has_attach {
+}
+
+/// Socket nodes (`Socket_*`) are plain nodes parented under a bone, so
+/// they follow the animated rig and Bevy can find them by `Name`. A
+/// socket that is itself a skin joint costs a palette slot and must be
+/// weight-free; one with no joint ancestor stays put while the body
+/// moves. A rigged hero needs `Socket_Hand_R` (the weapon hand).
+/// Name-based, so placement runs on every budget run; the missing-hand
+/// rule is hero-only and skips unrigged blockout prefabs.
+fn check_sockets(json: &Value, class: Option<AssetClass>, out: &mut Vec<(&'static str, String)>) {
+    let skins = arr(json, "skins");
+    if skins.is_empty() {
+        return;
+    }
+    let nodes = arr(json, "nodes");
+    let joints: BTreeSet<usize> = skins
+        .iter()
+        .flat_map(|s| arr(s, "joints").iter().filter_map(as_idx))
+        .collect();
+    let mut parent: Vec<Option<usize>> = vec![None; nodes.len()];
+    for (i, nd) in nodes.iter().enumerate() {
+        for c in arr(nd, "children").iter().filter_map(as_idx) {
+            if c < nodes.len() {
+                parent[c] = Some(i);
+            }
+        }
+    }
+    let name = |i: usize| nodes[i].get("name").and_then(Value::as_str).unwrap_or("");
+    let mut has_hand = false;
+    for i in 0..nodes.len() {
+        let n = name(i);
+        if !n.starts_with(glbkit::rig::SOCKET_PREFIX) {
+            continue;
+        }
+        has_hand |= n == glbkit::rig::HAND_SOCKET;
+        if joints.contains(&i) {
+            out.push((
+                "P_SOCKET",
+                format!("'{n}' is a skin joint (sockets are plain nodes under a bone)"),
+            ));
+            continue;
+        }
+        // Walk up (bounded: cycles are B_NODE_CYCLE's business).
+        let mut at = parent[i];
+        let mut steps = 0;
+        let mut under_bone = false;
+        while let Some(p) = at {
+            if joints.contains(&p) {
+                under_bone = true;
+                break;
+            }
+            steps += 1;
+            if steps > nodes.len() {
+                break;
+            }
+            at = parent[p];
+        }
+        if !under_bone {
+            out.push((
+                "P_SOCKET",
+                format!("'{n}' has no bone ancestor (it will not follow the rig)"),
+            ));
+        }
+    }
+    if class == Some(AssetClass::Hero) && !has_hand {
         out.push((
-            "P_WEAPON_ATTACH",
-            "no ATTACH-* node (weapons need a named grip point)".to_string(),
+            "P_SOCKET",
+            format!(
+                "no {} node (rigged heroes carry the weapon-hand socket)",
+                glbkit::rig::HAND_SOCKET
+            ),
         ));
+    }
+}
+
+/// A far `_LOD1` mesh exists to be cheaper: warn when it has at least
+/// as many triangles as its near mesh. Pairing itself is L_LOD_PAIR.
+fn check_lod_tris(json: &Value, out: &mut Vec<(&'static str, String)>) {
+    let nodes = arr(json, "nodes");
+    let meshes = arr(json, "meshes");
+    let mut sink = Vec::new();
+    let marks = crate::bevy::lod_markers(json, &mut sink);
+    let tris_of = |ni: usize| -> Option<usize> {
+        let m = meshes.get(nodes.get(ni)?.get("mesh").and_then(as_idx)?)?;
+        let c = mesh_counts(json, m);
+        (c.t_unknown == 0).then_some(c.tris)
+    };
+    for (name, (ni, near)) in &marks {
+        if !*near {
+            continue;
+        }
+        let Some((fi, false)) = marks.get(&format!("{name}{}", crate::bevy::LOD_SUFFIX)) else {
+            continue;
+        };
+        if let (Some(nt), Some(ft)) = (tris_of(*ni), tris_of(*fi)) {
+            if ft >= nt && nt > 0 {
+                out.push((
+                    "P_LOD_TRIS",
+                    format!(
+                        "'{name}{}': {ft} tris, not fewer than the near mesh's {nt}",
+                        crate::bevy::LOD_SUFFIX
+                    ),
+                ));
+            }
+        }
     }
 }
 
@@ -800,6 +930,8 @@ pub fn check_budgets(
     check_normal_map(json, class, &mut out);
     check_pieces(json, bin, &mut out);
     check_weapon(json, class, &mut out);
+    check_sockets(json, class, &mut out);
+    check_lod_tris(json, &mut out);
     // Reuses the weight layer's stats: prims it could not read (sparse,
     // malformed) contribute nothing here either.
     if skin.checked_prims > 0 && skin.max_influences > budget.max_influences {
@@ -993,7 +1125,7 @@ mod tests {
         );
         assert_eq!(
             ceilings(&Budget::mobile_for(Npc)),
-            (8_000, 6_000, 512, 4, 128)
+            (8_000, 6_000, 512, 4, 65)
         );
         assert_eq!(
             ceilings(&Budget::mobile_for(Monster)),
@@ -1031,7 +1163,7 @@ mod tests {
         // mobile defaults; hero keeps its own mobile default above.
         let npc = set.for_class(Some(Npc));
         assert_eq!(npc.max_tris_per_mesh, 50_000);
-        assert_eq!(npc.max_bones, 128);
+        assert_eq!(npc.max_bones, 65);
         assert_eq!(npc.max_texture_dim, 512);
         assert!(set.for_class(None).max_tris_per_mesh == 50_000);
     }

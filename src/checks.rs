@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Rig-contract checks over a parsed GLB document.
 
+use crate::bevy;
 use crate::budget;
 use crate::defects;
 use crate::glb;
@@ -84,18 +85,30 @@ fn node_name(nodes: &[Value], idx: usize) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+#[cfg(test)]
 pub fn check_glb(bytes: &[u8]) -> Report {
     check_glb_with_budget(bytes, None)
 }
 
+#[cfg(test)]
 pub fn check_glb_with_budget(bytes: &[u8], budget: Option<&budget::Budget>) -> Report {
     check_glb_with_class(bytes, budget, None)
 }
 
+#[cfg(test)]
 pub fn check_glb_with_class(
     bytes: &[u8],
     budget: Option<&budget::Budget>,
     class: Option<budget::AssetClass>,
+) -> Report {
+    check_glb_full(bytes, budget, class, &bevy::BevyOpts::default())
+}
+
+pub fn check_glb_full(
+    bytes: &[u8],
+    budget: Option<&budget::Budget>,
+    class: Option<budget::AssetClass>,
+    opts: &bevy::BevyOpts,
 ) -> Report {
     let doc = match glb::parse(bytes) {
         Ok(d) => d,
@@ -199,6 +212,10 @@ pub fn check_glb_with_class(
     }
 
     for (code, detail) in defects::check_defects(json, doc.bin) {
+        diags.push(Diag { code, detail });
+    }
+
+    for (code, detail) in bevy::check_bevy(json, doc.bin, opts) {
         diags.push(Diag { code, detail });
     }
 
@@ -326,6 +343,7 @@ mod tests {
     fn clean_rig_passes() {
         let doc = json!({
             "nodes": [{"name": "DEF-spine"}, {"name": "Cube", "mesh": 0}],
+            "scenes": [{"nodes": [0, 1]}],
             "meshes": [{"name": "Cube", "primitives": [{}]}],
             "skins": [{"joints": [0]}],
             "animations": [{
@@ -723,6 +741,7 @@ mod tests {
     fn anim_doc(nan: bool) -> (Value, Vec<u8>) {
         let doc = json!({
             "nodes": [{"name": "DEF-a"}],
+            "scenes": [{"nodes": [0]}],
             "skins": [{"joints": [0]}],
             "animations": [{
                 "channels": [{"target": {"node": 0}}],
@@ -953,8 +972,9 @@ mod tests {
         // stays quiet: budget tests must isolate the P_* layer.
         let pv = verts as usize * 12;
         let ib = idx as usize * 2;
+        // The hand socket keeps classed hero runs on the P_* under test.
         let doc = json!({
-            "nodes": [{"name": "DEF-a"}],
+            "nodes": [{"name": "DEF-a", "children": [1]}, {"name": "Socket_Hand_R"}],
             "skins": [{"joints": [0]}],
             "meshes": [{"name": "Hero", "primitives": [
                 {"attributes": {"POSITION": 0}, "indices": 1},
@@ -1155,6 +1175,11 @@ mod tests {
             nodes.push(json!({"name": format!("ctrl{i}")}));
             joints.push(json!(def + i));
         }
+        if def > 0 {
+            // Hand socket under the first bone: heroes need one.
+            nodes[0]["children"] = json!([nodes.len()]);
+            nodes.push(json!({"name": "Socket_Hand_R"}));
+        }
         json!({
             "nodes": nodes,
             "skins": [{"joints": joints}],
@@ -1241,7 +1266,7 @@ mod tests {
     fn class_normal_map_characters_only() {
         use budget::AssetClass::*;
         let bare = json!({
-            "nodes": [{"name": "DEF-a"}],
+            "nodes": [{"name": "DEF-a", "children": [1]}, {"name": "Socket_Hand_R"}],
             "skins": [{"joints": [0]}],
         });
         let r = classed(&pack(&bare), Hero);
@@ -1355,11 +1380,12 @@ mod tests {
     #[test]
     fn class_weapon_shape() {
         use budget::AssetClass::Weapon;
+        // Unrigged, origin at the grip: the weapon shape, fully clean.
+        // No grip node needed (the Godot-era ATTACH-* rule is gone).
         let sword = json!({
-            "nodes": [{"name": "Sword", "mesh": 0}, {"name": "ATTACH-Grip"}],
+            "nodes": [{"name": "Sword", "mesh": 0}],
             "meshes": [{"name": "Sword", "primitives": [{}]}],
         });
-        // Unrigged + grip point: the correct weapon shape, fully clean.
         let r = classed(&pack(&sword), Weapon);
         assert!(
             r.diags.is_empty(),
@@ -1375,17 +1401,101 @@ mod tests {
         assert!(codes(&r).contains(&"R_JOINT_PREFIX"));
         let d = warn_for(&r, "P_WEAPON_SKIN").expect("missing P_WEAPON_SKIN");
         assert!(d.contains("1 skin"), "no count: {d}");
-        // No grip point warns.
-        let mut gripless = sword.clone();
-        gripless["nodes"] = json!([{"name": "Sword", "mesh": 0}]);
-        let r = classed(&pack(&gripless), Weapon);
+        assert!(warn_for(&r, "P_WEAPON_ATTACH").is_none());
+    }
+
+    #[test]
+    fn class_hero_sockets() {
+        use budget::AssetClass::*;
+        // Socket under the hand bone: clean.
+        let good = json!({
+            "nodes": [{"name": "DEF-hand.R", "children": [1]}, {"name": "Socket_Hand_R"}],
+            "skins": [{"joints": [0]}],
+            "materials": [{"normalTexture": {"index": 0}}],
+        });
+        let r = classed(&pack(&good), Hero);
         assert!(
-            r.diags.is_empty(),
-            "still unrigged-clean: {:?}",
-            diags_str(&r)
+            r.warnings().is_empty(),
+            "{:?}",
+            r.warnings().iter().map(|w| &w.detail).collect::<Vec<_>>()
         );
-        let d = warn_for(&r, "P_WEAPON_ATTACH").expect("missing P_WEAPON_ATTACH");
-        assert!(d.contains("ATTACH-*"), "detail: {d}");
+        // Rigged hero with no hand socket.
+        let mut none = good.clone();
+        none["nodes"] = json!([{"name": "DEF-hand.R"}]);
+        let r = classed(&pack(&none), Hero);
+        let d = warn_for(&r, "P_SOCKET").expect("missing P_SOCKET");
+        assert!(d.contains("no Socket_Hand_R node"), "{d}");
+        // NPCs need not carry one; unrigged hero blockouts skip.
+        assert!(warn_for(&classed(&pack(&none), Npc), "P_SOCKET").is_none());
+        let blockout = json!({"nodes": [{"name": "Body", "mesh": 0}],
+                              "meshes": [{"primitives": [{}]}]});
+        assert!(warn_for(&classed(&pack(&blockout), Hero), "P_SOCKET").is_none());
+        // A socket left at the root, and a socket that is a joint.
+        let loose = json!({
+            "nodes": [{"name": "DEF-hand.R"}, {"name": "Socket_Hand_R"}, {"name": "Socket_Back"}],
+            "skins": [{"joints": [0, 2]}],
+            "materials": [{"normalTexture": {"index": 0}}],
+        });
+        let r = classed(&pack(&loose), Hero);
+        let w: Vec<&str> = r
+            .warnings()
+            .iter()
+            .filter(|w| w.code == "P_SOCKET")
+            .map(|w| w.detail.as_str())
+            .collect();
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(
+            w[0].contains("'Socket_Hand_R' has no bone ancestor"),
+            "{w:?}"
+        );
+        assert!(w[1].contains("'Socket_Back' is a skin joint"), "{w:?}");
+    }
+
+    #[test]
+    fn lod_far_mesh_must_be_cheaper() {
+        let marker = |near: bool| json!({"skein": [{"hll::level::RenderLod": {"near": near}}]});
+        let doc = |far_idx: u64| {
+            json!({
+                "nodes": [
+                    {"name": "Rock", "mesh": 0, "extras": marker(true)},
+                    {"name": "Rock_LOD1", "mesh": 1, "extras": marker(false)},
+                ],
+                "meshes": [
+                    {"primitives": [{"attributes": {"POSITION": 0}, "indices": 1}]},
+                    {"primitives": [{"attributes": {"POSITION": 0}, "indices": 2}]},
+                ],
+                "accessors": [{"count": 3}, {"count": 300}, {"count": far_idx}],
+            })
+        };
+        let mobile = budget::Budget::default();
+        let r = check_glb_with_budget(&pack(&doc(105)), Some(&mobile));
+        assert!(warn_for(&r, "P_LOD_TRIS").is_none());
+        let r = check_glb_with_budget(&pack(&doc(300)), Some(&mobile));
+        let d = warn_for(&r, "P_LOD_TRIS").expect("missing P_LOD_TRIS");
+        assert!(
+            d.contains("'Rock_LOD1': 100 tris, not fewer than the near mesh's 100"),
+            "{d}"
+        );
+    }
+
+    #[test]
+    fn class_level_unrigged_with_lods() {
+        use budget::AssetClass::Level;
+        let marker = |near: bool| json!({"skein": [{"hll::level::RenderLod": {"near": near}}]});
+        let doc = json!({
+            "nodes": [
+                {"name": "Rock", "mesh": 0, "extras": marker(true)},
+                {"name": "Rock_LOD1", "mesh": 0, "extras": marker(false)},
+                {"name": "Tree", "mesh": 0, "extras": marker(true)},
+            ],
+            "scenes": [{"nodes": [0, 1, 2]}],
+            "meshes": [{"primitives": [{}]}],
+        });
+        let r = classed(&pack(&doc), Level);
+        // Unrigged is fine; the unpaired near mesh fails.
+        assert_eq!(codes(&r), vec!["L_LOD_PAIR"]);
+        assert!(r.summary.contains("class level"), "{}", r.summary);
+        assert_eq!(budget::Budget::mobile_for(Level).max_tris_per_mesh, 100_000);
     }
 
     #[test]
@@ -1393,6 +1503,7 @@ mod tests {
         use budget::AssetClass::*;
         let doc = json!({
             "nodes": [{"name": "Crate", "mesh": 0}],
+            "scenes": [{"nodes": [0]}],
             "meshes": [{"name": "Crate", "primitives": [{}]}],
             "animations": [{
                 "channels": [{"target": {"node": 0}}],

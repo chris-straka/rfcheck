@@ -2,9 +2,10 @@
 //! rfcheck: rig-contract checker for game-bound GLBs.
 //!
 //! Blender (rigforge) makes the GLBs; rfcheck verifies them:
-//! container parses, exactly one DEF-only skeleton, animations target
-//! DEF joints. See README.md.
+//! container parses, DEF-only skeleton, animations target DEF joints,
+//! and Bevy 0.19's glTF loader takes the file whole. See README.md.
 
+mod bevy;
 mod budget;
 mod checks;
 mod defects;
@@ -19,7 +20,8 @@ use std::process::ExitCode;
 
 fn print_help() {
     println!(
-        "usage: rfcheck [--json] [--mobile] [--budget file] [--class name] [--] file.glb ...\n\
+        "usage: rfcheck [--json] [--mobile] [--budget file] [--class name]\n\
+         \x20             [--image-codecs list] [--] file.glb ...\n\
          \n\
          Check each GLB against the rigforge export contract and print\n\
          one `CODE path: detail` line per finding (OK line when clean).\n\
@@ -27,8 +29,10 @@ fn print_help() {
          --mobile checks mobile perf budgets too (P_* warnings, never fail).\n\
          --budget file overrides budget keys via a JSON object or flat TOML.\n\
          --class name checks as one asset class (hero, npc, monster, prop,\n\
-         weapon): per-class mobile budgets, and prop/weapon files may be\n\
-         unrigged. Implies budget checks, like --budget."
+         weapon, level): per-class mobile budgets, and prop/weapon/level\n\
+         files may be unrigged. Implies budget checks, like --budget.\n\
+         --image-codecs list sets the texture codecs the game's Bevy build\n\
+         decodes (default png,ktx2; also jpeg, webp, dds, hdr)."
     );
 }
 
@@ -38,6 +42,7 @@ fn main() -> ExitCode {
     let mut want_budget = false;
     let mut budget_path: Option<&str> = None;
     let mut class: Option<budget::AssetClass> = None;
+    let mut codecs: Vec<&'static str> = bevy::DEFAULT_CODECS.to_vec();
     let mut files: Vec<&str> = Vec::new();
     let mut only_files = false;
     let mut i = 0;
@@ -79,6 +84,19 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             }
+        } else if a == "--image-codecs" {
+            i += 1;
+            match raw.get(i).map(|l| bevy::parse_codecs(l)) {
+                Some(Ok(c)) => codecs = c,
+                Some(Err(e)) => {
+                    eprintln!("rfcheck: {e}");
+                    return ExitCode::from(2);
+                }
+                None => {
+                    eprintln!("rfcheck: --image-codecs needs a list argument (see --help)");
+                    return ExitCode::from(2);
+                }
+            }
         } else if a == "-h" || a == "--help" {
             print_help();
             return ExitCode::SUCCESS;
@@ -111,15 +129,16 @@ fn main() -> ExitCode {
         None => None,
     };
 
+    let opts = bevy::BevyOpts { codecs: &codecs };
     let mut failed = false;
     for f in &files {
         let path = Path::new(f);
         let report = match fs::read(path) {
             Err(e) => checks::Report::unreadable(format!("cannot read file: {e}"), class),
-            Ok(bytes) => match &budgets {
-                Some(s) => checks::check_glb_with_class(&bytes, Some(s.for_class(class)), class),
-                None => checks::check_glb(&bytes),
-            },
+            Ok(bytes) => {
+                let b = budgets.as_ref().map(|s| s.for_class(class));
+                checks::check_glb_full(&bytes, b, class, &opts)
+            }
         };
         if json_out {
             println!("{}", report.to_json(path));
