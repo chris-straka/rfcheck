@@ -15,6 +15,13 @@ pub const WEIGHT_TOL: f64 = 1e-3;
 /// are remeshed separately and must follow their own bones.
 pub const PIECE_WORDS: &[&str] = &["cape", "cloak", "hair", "ponytail", "braid"];
 
+/// Attachment sockets are plain nodes named `Socket_*`, parented under a
+/// bone; the game finds them by name (HLL: weapons snap to the hand).
+pub const SOCKET_PREFIX: &str = "Socket_";
+
+/// The weapon-hand socket every rigged hero carries.
+pub const HAND_SOCKET: &str = "Socket_Hand_R";
+
 pub fn is_deform_bone(name: &str) -> bool {
     name.starts_with(DEFORM_PREFIX)
 }
