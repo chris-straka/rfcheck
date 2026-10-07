@@ -96,6 +96,16 @@ fn check(path: &Path) -> Result<String, String> {
     let world = app.world();
     let gltf = world.resource::<Assets<Gltf>>().get(&handle).ok_or("Gltf asset missing")?;
     let (n_meshes, n_skins, n_clips) = (gltf.meshes.len(), gltf.skins.len(), gltf.animations.len());
+    // Bevy drops curves on nodes outside every scene and merges nodes
+    // sharing a name path, and named_animations keeps one clip per name:
+    // report what survived so rfcheck's B_ANIM_* / B_CLIP_NAME can be
+    // compared against the loader.
+    let n_named = gltf.named_animations.len();
+    let clips = world.resource::<Assets<AnimationClip>>();
+    let mut n_targets = 0;
+    for h in &gltf.animations {
+        n_targets += clips.get(h).ok_or("AnimationClip missing")?.curves().len();
+    }
     let scene = gltf.default_scene.clone().or_else(|| gltf.scenes.first().cloned());
     let gltf_meshes = world.resource::<Assets<GltfMesh>>();
     let meshes = world.resource::<Assets<Mesh>>();
@@ -145,6 +155,7 @@ fn check(path: &Path) -> Result<String, String> {
     }
     Ok(format!(
         "{n_meshes} meshes / {prims} prims / {verts} verts, {n_skins} skins, \
-         {skinned_entities} SkinnedMesh entities, {n_clips} clips"
+         {skinned_entities} SkinnedMesh entities, {n_clips} clips ({n_named} named, \
+         {n_targets} animated targets)"
     ))
 }
