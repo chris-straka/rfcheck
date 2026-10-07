@@ -154,8 +154,7 @@ Class runs also enable convention checks (still WARN-level):
   weights skip silently (nothing provable). Detection is by mesh
   name alone, so this one also runs on unclassed budget runs
   (`--mobile`, `--budget`).
-- Weapons (`--class weapon` only) attach to the hand bone in Godot
-  (`BoneAttachment3D`): `P_WEAPON_SKIN` fires when the file carries
+- Weapons (`--class weapon` only) attach to the hand bone in the game: `P_WEAPON_SKIN` fires when the file carries
   a skin, `P_WEAPON_ATTACH` when no node is named `ATTACH-*` (the
   grip point the importer snaps to the hand).
 
@@ -236,7 +235,8 @@ errors.
   (`D_GLB_TRUNC`, previously a misleading `W_BAD_ACCESSOR`); the
   summary counts budget-run findings as `N warnings` (was
   `N over budget`, which miscounted convention warnings).
-- HLL CI wiring: done — `validate_assets.py` shells out for inbound
-  character/creature GLBs, and HLL's CI installs rfcheck via cargo.
+- HLL wiring: done — `gk validate assets` (HLL's `validate_assets.py` is a
+  thin wrapper) runs rfcheck on inbound character/creature GLBs when it is
+  on PATH (`--rfcheck`, `--no-rfcheck`); HLL's CI no longer installs it.
 
 License: MIT.
