@@ -23,3 +23,38 @@
       joints), `P_WEAPON_SKIN` / `P_WEAPON_ATTACH` (`ATTACH-*`
       grip node) for `--class weapon`; prop/weapon runs may be
       unrigged.
+
+## Requested 2026-10-06: Bevy re-plan (games are Bevy 0.19)
+
+- [x] Drop Godot-only checks: `P_WEAPON_ATTACH` (`ATTACH-*` grip node for
+      Godot `BoneAttachment3D`) removed; weapons snap to the hand socket.
+- [x] What Bevy's glTF loader needs (`B_*`, fail): required extensions,
+      primitive modes, node cycles, texture codecs vs the game's Bevy
+      features (`--image-codecs`), morph limits, animation curves Bevy
+      drops (orphan nodes, same-name paths), duplicate clip names.
+- [x] LOD markers: `L_LOD_PAIR` (HLL `RenderLod` near/far pairing, fail),
+      `P_LOD_TRIS` (far mesh not cheaper, warn); `--class level` so
+      levels can go through rfcheck unrigged.
+- [x] Sockets: `P_SOCKET` (`Socket_*` under a bone, not a joint;
+      rigged heroes carry `Socket_Hand_R`).
+- [x] Mobile bone budgets: NPC 65 (rigforge MOBILE profile); generic 256
+      is Bevy's `MAX_JOINTS`.
+- [x] Output format unchanged for `gk` (same text lines, JSON keys, exit
+      codes).
+
+Verified 2026-10-06 on f-ms-7917: 86 HLL GLBs (characters by gk class,
+levels/kit as `--class level`): no `B_*`/`L_*`/`P_SOCKET`/`P_LOD_TRIS`
+findings; 82 RenderLod pairs all matched. Pre-existing findings
+unchanged (andras_rig: bake-off bone names, 13.6k verts, 2k textures).
+
+### Open
+
+- [ ] Owner decision (Decisions, 2026-10-06): HLL's bake-off bone names
+      (`Hips`, `Hand_R`, ...) vs rigforge `DEF-*`. Until then
+      `andras_rig.glb` keeps `R_JOINT_PREFIX` / `R_ANIM_TARGET`.
+- [ ] gk (games/tools, not this repo): fail on `B_*` and `L_*`, not only
+      `D_*` (they are load failures / vanishing meshes); map
+      `levels = "level"` in `class_by_dir` so levels get the LOD checks.
+- [ ] Required clip set per class (HLL needs idle/walk/run/attack_1-3/
+      dodge/hit/death; the game panics on a missing one). Needs string
+      lists in the budget file format.
