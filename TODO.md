@@ -46,6 +46,9 @@ Verified 2026-10-06 on f-ms-7917: 86 HLL GLBs (characters by gk class,
 levels/kit as `--class level`): no `B_*`/`L_*`/`P_SOCKET`/`P_LOD_TRIS`
 findings; 82 RenderLod pairs all matched. Pre-existing findings
 unchanged (andras_rig: bake-off bone names, 13.6k verts, 2k textures).
+`gk validate assets` on HLL: output byte-identical to rfcheck 0.5.1 (as
+are `--json --class hero|npc|monster` and plain runs). Every B_* rule
+confirmed against Bevy's loader (glbkit/compat/README.md).
 
 ### Open
 

@@ -39,3 +39,24 @@ Blender's writer for the reverse direction. Exit 1 on any failure.
 | Truncated GLB (negative control) | rejected | rejected |
 
 Round-tripped files carry the same rfcheck codes as their sources.
+
+## rfcheck Bevy layer (2026-10-06, Bevy 0.19.1, f-ms-7917)
+
+`cargo run --example bevy_fixtures -- DIR` in the rfcheck root writes one
+GLB per `B_*`/`L_*` code. rfcheck raises exactly the named code on each;
+Bevy agrees:
+
+| Fixture | rfcheck | Bevy loader |
+|---|---|---|
+| `ok_base`, `ok_lod_pair` | clean | loads |
+| `B_EXT_REQUIRED` (Draco) | fail | "Unsupported extension" |
+| `B_PRIM_MODE` (fan) | fail | "unsupported primitive mode" |
+| `B_NODE_CYCLE` | fail | "must be a tree" |
+| `B_IMAGE_CODEC` (webp; PNG bytes as KTX2) | fail | both fail to decode |
+| `B_MORPH_LIMIT` (257 targets) | fail | "up to 256 morph targets" |
+| `B_ANIM_ORPHAN`, `B_ANIM_PATH` (2 channels) | fail | loads, 1 animated target |
+| `B_CLIP_NAME` (2 x "idle") | fail | loads, 2 clips / 1 named |
+| `L_LOD_PAIR` | fail | loads (game convention, not a loader rule) |
+
+All 86 HLL GLBs load (andras_rig: 9 clips, 252 targets = 9 x 28 bones,
+nothing dropped), matching zero `B_*` findings from rfcheck.
