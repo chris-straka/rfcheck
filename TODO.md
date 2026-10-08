@@ -1,5 +1,5 @@
 
-## Requested 2026-10-01 (see ~/SWE/games/tools/roadmap.md)
+## Requested 2026-10-01 (see ~/SWE/games/_tools/roadmap.md)
 
 - [x] Mesh budget per asset class (hero 5k-15k tris, NPC, monster, prop)
       from the budget TOML, with a mobile profile.
@@ -55,7 +55,7 @@ confirmed against Bevy's loader (glbkit/compat/README.md).
 - [ ] Owner decision (Decisions, 2026-10-06): HLL's bake-off bone names
       (`Hips`, `Hand_R`, ...) vs rigforge `DEF-*`. Until then
       `andras_rig.glb` keeps `R_JOINT_PREFIX` / `R_ANIM_TARGET`.
-- [ ] gk (games/tools, not this repo): fail on `B_*` and `L_*`, not only
+- [ ] gk (games/_tools, not this repo): fail on `B_*` and `L_*`, not only
       `D_*` (they are load failures / vanishing meshes); map
       `levels = "level"` in `class_by_dir` so levels get the LOD checks.
 - [ ] Required clip set per class (HLL needs idle/walk/run/attack_1-3/
