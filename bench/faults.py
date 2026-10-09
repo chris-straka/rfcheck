@@ -4,7 +4,7 @@
     python3 bench/faults.py [--tag NAME] [clean.glb ...]
 
 Clean inputs default to the CC0 characters motionforge's bench writes
-(standardized and animated MPFB2 bodies, ~/SWE/blender/motionforge/bench/
+(standardized and animated MPFB2 bodies, ~/Games/_blender/motionforge/bench/
 results/*/*/{std,anim}.glb, DEF- named) and the raw corpus (Unreal names,
 so R_JOINT_PREFIX is expected there and listed apart). Each clean file is
 checked as is (false alarms = any contract code on it), then once per
@@ -216,7 +216,7 @@ def main():
     a = ap.parse_args()
     if not os.path.exists(CLI):
         subprocess.run(["cargo", "build", "--release", "-j2"], cwd=ROOT, check=True)
-    files = a.files or sorted(glob.glob(os.path.expanduser("~/SWE/blender/motionforge/bench/results/baseline/*/*.glb")))
+    files = a.files or sorted(glob.glob(os.path.expanduser("~/Games/_blender/motionforge/bench/results/baseline/*/*.glb")))
     out = os.path.join(HERE, "results", a.tag)
     os.makedirs(out, exist_ok=True)
     rows, times = [], []
