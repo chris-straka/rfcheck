@@ -32,7 +32,7 @@
       primitive modes, node cycles, texture codecs vs the game's Bevy
       features (`--image-codecs`), morph limits, animation curves Bevy
       drops (orphan nodes, same-name paths), duplicate clip names.
-- [x] LOD markers: `L_LOD_PAIR` (HLL `RenderLod` near/far pairing, fail),
+- [x] LOD markers: `L_LOD_PAIR` (`<crate>::level::RenderLod` near/far pairing, fail),
       `P_LOD_TRIS` (far mesh not cheaper, warn); `--class level` so
       levels can go through rfcheck unrigged.
 - [x] Sockets: `P_SOCKET` (`Socket_*` under a bone, not a joint;
@@ -42,22 +42,22 @@
 - [x] Output format unchanged for `gk` (same text lines, JSON keys, exit
       codes).
 
-Verified 2026-10-06 on f-ms-7917: 86 HLL GLBs (characters by gk class,
+Verified 2026-10-06 on f-ms-7917: 86 GLBs of one game (characters by gk class,
 levels/kit as `--class level`): no `B_*`/`L_*`/`P_SOCKET`/`P_LOD_TRIS`
 findings; 82 RenderLod pairs all matched. Pre-existing findings
-unchanged (andras_rig: bake-off bone names, 13.6k verts, 2k textures).
-`gk validate assets` on HLL: output byte-identical to rfcheck 0.5.1 (as
+unchanged (the hero rig: bake-off bone names, 13.6k verts, 2k textures).
+`gk validate assets` on that game: output byte-identical to rfcheck 0.5.1 (as
 are `--json --class hero|npc|monster` and plain runs). Every B_* rule
 confirmed against Bevy's loader (glbkit/compat/README.md).
 
 ### Open
 
-- [ ] Owner decision (Decisions, 2026-10-06): HLL's bake-off bone names
+- [ ] Owner decision (Decisions, 2026-10-06): a game's bake-off bone names
       (`Hips`, `Hand_R`, ...) vs rigforge `DEF-*`. Until then
-      `andras_rig.glb` keeps `R_JOINT_PREFIX` / `R_ANIM_TARGET`.
+      that hero rig keeps `R_JOINT_PREFIX` / `R_ANIM_TARGET`.
 - [ ] gk (games/_tools, not this repo): fail on `B_*` and `L_*`, not only
       `D_*` (they are load failures / vanishing meshes); map
       `levels = "level"` in `class_by_dir` so levels get the LOD checks.
-- [ ] Required clip set per class (HLL needs idle/walk/run/attack_1-3/
+- [ ] Required clip set per class (e.g. a game needs idle/walk/run/attack_1-3/
       dodge/hit/death; the game panics on a missing one). Needs string
       lists in the budget file format.

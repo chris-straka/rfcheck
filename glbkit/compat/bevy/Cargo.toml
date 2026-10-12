@@ -7,7 +7,7 @@ publish = false
 description = "Loads GLBs through Bevy's glTF loader headless; nonzero exit if any fails"
 
 [dependencies]
-# Same Bevy pin as the games (hll-bevy). `jpeg`: AI generators (Tripo, UniRig output) embed JPEG textures.
+# Same Bevy pin as the games. `jpeg`: AI generators (Tripo, UniRig output) embed JPEG textures.
 bevy = { version = "=0.19.1", features = ["jpeg"] }
 
 # Standalone: not part of the rfcheck workspace (Bevy is a heavy build).

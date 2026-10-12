@@ -10,7 +10,7 @@ cd glbkit/compat/bevy
 cargo run --release --example check -- a.glb b.glb ...
 ```
 
-Loads each file through Bevy 0.19.1's glTF loader (same pin as hll-bevy),
+Loads each file through Bevy 0.19.1's glTF loader (same pin as the games),
 spawns the default scene, and checks that every declared skin becomes
 `SkinnedMesh` entities with joint indices and weights. Exit 1 on any
 failure. Standalone crate (own `[workspace]`): Bevy is a long first build.
@@ -58,5 +58,5 @@ Bevy agrees:
 | `B_CLIP_NAME` (2 x "idle") | fail | loads, 2 clips / 1 named |
 | `L_LOD_PAIR` | fail | loads (game convention, not a loader rule) |
 
-All 86 HLL GLBs load (andras_rig: 9 clips, 252 targets = 9 x 28 bones,
+All 86 GLBs of one game's asset set load (a rigged hero: 9 clips, 252 targets = 9 x 28 bones,
 nothing dropped), matching zero `B_*` findings from rfcheck.

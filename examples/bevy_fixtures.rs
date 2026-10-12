@@ -80,7 +80,7 @@ fn channel(node: usize) -> Value {
 }
 
 fn lod(near: bool) -> Value {
-    json!({"skein": [{"hll::level::RenderLod": {"near": near}}]})
+    json!({"skein": [{"demo::level::RenderLod": {"near": near}}]})
 }
 
 fn main() {

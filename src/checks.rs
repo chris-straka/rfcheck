@@ -1453,7 +1453,7 @@ mod tests {
 
     #[test]
     fn lod_far_mesh_must_be_cheaper() {
-        let marker = |near: bool| json!({"skein": [{"hll::level::RenderLod": {"near": near}}]});
+        let marker = |near: bool| json!({"skein": [{"demo::level::RenderLod": {"near": near}}]});
         let doc = |far_idx: u64| {
             json!({
                 "nodes": [
@@ -1481,7 +1481,7 @@ mod tests {
     #[test]
     fn class_level_unrigged_with_lods() {
         use budget::AssetClass::Level;
-        let marker = |near: bool| json!({"skein": [{"hll::level::RenderLod": {"near": near}}]});
+        let marker = |near: bool| json!({"skein": [{"demo::level::RenderLod": {"near": near}}]});
         let doc = json!({
             "nodes": [
                 {"name": "Rock", "mesh": 0, "extras": marker(true)},

@@ -16,7 +16,7 @@ pub const WEIGHT_TOL: f64 = 1e-3;
 pub const PIECE_WORDS: &[&str] = &["cape", "cloak", "hair", "ponytail", "braid"];
 
 /// Attachment sockets are plain nodes named `Socket_*`, parented under a
-/// bone; the game finds them by name (HLL: weapons snap to the hand).
+/// bone; the game finds them by name (e.g. weapons snap to the hand).
 pub const SOCKET_PREFIX: &str = "Socket_";
 
 /// The weapon-hand socket every rigged hero carries.

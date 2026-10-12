@@ -3,7 +3,7 @@
 Rig-contract checker for game-bound GLBs. Blender (rigforge) makes the
 GLBs; rfcheck verifies them — no Blender needed, so it runs in CI, in
 tests, and against any rigger's output (hello, bake-off). The games are
-Bevy 0.19, so it also checks what Bevy's glTF loader needs (`B_*`), HLL's
+Bevy 0.19, so it also checks what Bevy's glTF loader needs (`B_*`), a game's
 distant-mesh markers (`L_*`), and attachment sockets.
 
 ```sh
@@ -135,7 +135,7 @@ fail, and fire only on what the JSON proves.
   `extensionsRequired` fails validation. Optional (`extensionsUsed`)
   extensions are ignored, not errors.
 - Textures: only images a texture uses are loaded. The default codec
-  set is HLL's Bevy build (`2d`/`3d`/`ui` features: `png`, `ktx2`);
+  set is a default Bevy build (`2d`/`3d`/`ui` features: `png`, `ktx2`);
   `--image-codecs png,ktx2,jpeg` widens it for a game that enables
   more. AI GLBs (Tripo) embed JPEG: re-encode them, or enable Bevy's
   `jpeg` feature in the game and pass the flag.
@@ -145,17 +145,18 @@ fail, and fire only on what the JSON proves.
   game looks clips up by name, so names must be unique.
 - Joint palette: Bevy's `MAX_JOINTS` is 256, the generic `max_bones`.
 
-`L_LOD_PAIR` reads HLL's Skein marker
-`{"skein": [{"hll::level::RenderLod": {"near": bool}}]}` (written by
-HLL `tools/add_port_lods.py`). A near mesh `X` pairs with the far
+`L_LOD_PAIR` reads the game's Skein marker
+`{"skein": [{"<crate>::level::RenderLod": {"near": bool}}]}`, where
+`<crate>` is any game crate name (e.g. `demo::level::RenderLod`),
+written by the game's level tooling. A near mesh `X` pairs with the far
 mesh `X_LOD1`. On mobile the near one hides past 40–50 m and the far
 one shows from there, so an unpaired marker is a mesh that pops out
 or never hands off. Budget runs add `P_LOD_TRIS` when a far mesh is
 not cheaper than its near one.
 
 Sockets are plain nodes named `Socket_*`, parented under a bone, that
-the game finds by `Name` (HLL snaps the sword to `Socket_Hand_R` every
-frame). Budget runs warn (`P_SOCKET`) when a socket has no bone
+the game finds by `Name` (e.g. a game snaps the sword to `Socket_Hand_R`
+every frame). Budget runs warn (`P_SOCKET`) when a socket has no bone
 ancestor or is itself a skin joint, and when a rigged hero has no
 `Socket_Hand_R`. Unrigged blockout prefabs skip.
 
@@ -197,7 +198,8 @@ only for classed runs). `--class` implies budget checks, like
 | `weapon` | 2,000 | 1,500 | 512 | 4 | 16 |
 | `level` | 100,000 | 65,535 | 2048 | 4 | 256 |
 
-Heroes follow HLL art direction (5k–15k tris, 512–1024 px textures)
+Heroes get 5k–15k tris and 512–1024 px textures (a mid-poly
+stylized hero that reads on a phone screen)
 and allow 160 deform bones, the full rigforge hero rig with face, fingers
 and twists (owner decision, 2026-10-04); NPCs get rigforge's MOBILE
 profile (65 deform bones: no face, no twists; v0.6.0, was 128);
@@ -305,9 +307,9 @@ errors.
   `P_WEAPON_ATTACH` removed. Output format unchanged (same text lines,
   same JSON keys, same exit codes), so `gk validate assets` reads it
   as before.
-- HLL wiring: done — `gk validate assets` (HLL's `validate_assets.py` is a
-  thin wrapper) runs rfcheck on inbound character/creature GLBs when it is
-  on PATH (`--rfcheck`, `--no-rfcheck`); HLL's CI no longer installs it.
+- Game wiring: done — `gk validate assets` runs rfcheck on inbound
+  character/creature GLBs when it is on PATH (`--rfcheck`, `--no-rfcheck`);
+  game CI does not need to install it separately.
 
 ## Verification
 

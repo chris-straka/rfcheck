@@ -6,9 +6,10 @@
 //! loses data from, read off its source (cited per check), so like X_*
 //! these are FAIL-level and fire only on what the JSON proves.
 //!
-//! L_* covers HLL's distant-mesh markers: Skein extras
-//! `{"skein": [{"hll::level::RenderLod": {"near": bool}}]}` written by
-//! `tools/add_port_lods.py`. A near mesh `X` pairs with a far mesh
+//! L_* covers a game's distant-mesh markers: Skein extras
+//! `{"skein": [{"<crate>::level::RenderLod": {"near": bool}}]}`, where
+//! `<crate>` is the game's crate name (any crate matches), written by the
+//! game's level tooling. A near mesh `X` pairs with a far mesh
 //! `X_LOD1`; on mobile the near one hides past 50 m and the far one
 //! shows, so an unpaired marker is a mesh that vanishes (or doubles).
 
@@ -29,9 +30,9 @@ pub const BEVY_REQUIRED_OK: &[&str] = &[
     "KHR_materials_emissive_strength",
 ];
 
-/// Image codecs the game's Bevy build decodes. HLL builds Bevy with
-/// `default-features = false, features = ["2d", "3d", "ui"]`, which
-/// brings `png`, `hdr`, and `ktx2` (+ zstd) but not `jpeg`, `webp`, or
+/// Image codecs a game's Bevy build decodes by default. A game that
+/// builds Bevy with `default-features = false, features = ["2d", "3d",
+/// "ui"]` gets `png`, `hdr`, and `ktx2` (+ zstd) but not `jpeg`, `webp`, or
 /// `dds`. A texture in a missing codec fails the whole GLB load
 /// ("You may need to add the feature for the file format").
 pub const DEFAULT_CODECS: &[&str] = &["png", "ktx2"];
@@ -44,8 +45,19 @@ pub const MAX_MORPH_TARGETS: usize = 256;
 /// 2048 x 2048 (`MAX_TEXTURE_WIDTH`, `MorphAttributes::COMPONENT_COUNT`).
 pub const MAX_MORPH_VERTS: usize = 2048 * 2048 / 9;
 
-/// The Skein type path HLL's level loader registers.
-pub const RENDER_LOD: &str = "hll::level::RenderLod";
+/// Skein type path suffix of the LOD marker a game's level loader
+/// registers: `<crate>::level::RenderLod` for any game crate.
+pub const RENDER_LOD: &str = "::level::RenderLod";
+
+/// True when a Skein entry key is `<crate>::level::RenderLod` for some
+/// crate name (a non-empty Rust identifier).
+pub fn is_render_lod_key(key: &str) -> bool {
+    key.strip_suffix(RENDER_LOD).is_some_and(|c| {
+        !c.is_empty()
+            && !c.starts_with(|ch: char| ch.is_ascii_digit())
+            && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    })
+}
 /// Far-mesh name suffix (`add_port_lods.py`).
 pub const LOD_SUFFIX: &str = "_LOD1";
 
@@ -467,10 +479,14 @@ fn check_anims(json: &Value, out: &mut Vec<(&'static str, String)>) {
 /// marker is present but unreadable, None when there is no marker.
 fn render_lod(node: &Value) -> Option<Result<bool, String>> {
     let entries = node.get("extras")?.get("skein")?.as_array()?;
-    let e = entries.iter().find_map(|e| e.get(RENDER_LOD))?;
+    let (key, e) = entries
+        .iter()
+        .filter_map(Value::as_object)
+        .flat_map(|o| o.iter())
+        .find(|(k, _)| is_render_lod_key(k))?;
     Some(match e.get("near").and_then(Value::as_bool) {
         Some(b) => Ok(b),
-        None => Err(format!("{RENDER_LOD} marker without a boolean 'near'")),
+        None => Err(format!("{key} marker without a boolean 'near'")),
     })
 }
 
@@ -631,7 +647,7 @@ mod tests {
         // PNG declared PNG: clean (the unused JPEG image is never loaded).
         let doc = image_doc(Some("image/png"), png.len());
         assert!(codes_of(&doc, &png, DEFAULT_CODECS).is_empty());
-        // JPEG: not in HLL's Bevy build, fine once the game enables it.
+        // JPEG: not in the default Bevy build, fine once the game enables it.
         let doc = image_doc(Some("image/jpeg"), jpg.len());
         let d = only(&codes_of(&doc, &jpg, DEFAULT_CODECS), "B_IMAGE_CODEC");
         assert_eq!(d.len(), 1);
@@ -766,8 +782,8 @@ mod tests {
 
     fn lod(name: &str, near: Value) -> Value {
         json!({"name": name, "extras": {"skein": [
-            {"hll::level::LevelCollider": {}},
-            {RENDER_LOD: {"near": near}}]}})
+            {"demo::level::LevelCollider": {}},
+            {"demo::level::RenderLod": {"near": near}}]}})
     }
 
     #[test]
@@ -793,7 +809,7 @@ mod tests {
             "{all}"
         );
         assert!(
-            all.contains("'Moss': hll::level::RenderLod marker without a boolean 'near'"),
+            all.contains("'Moss': demo::level::RenderLod marker without a boolean 'near'"),
             "{all}"
         );
         // Both halves marked near: reported once, on the far-named one.
@@ -801,5 +817,25 @@ mod tests {
         let d = only(&run(doc), "L_LOD_PAIR");
         assert_eq!(d.len(), 1, "{d:?}");
         assert!(d[0].contains("'Rock_LOD1': named like a far mesh but marked near"));
+    }
+
+    #[test]
+    fn render_lod_any_crate() {
+        assert!(is_render_lod_key("demo::level::RenderLod"));
+        assert!(is_render_lod_key("my_game2::level::RenderLod"));
+        assert!(!is_render_lod_key("::level::RenderLod"));
+        assert!(!is_render_lod_key("a::b::level::RenderLod"));
+        assert!(!is_render_lod_key("demo::level::RenderLodX"));
+        assert!(!is_render_lod_key("level::RenderLod"));
+        let mark = |k: &str, name: &str, near: bool| {
+            json!({"name": name, "extras": {"skein": [{k: {"near": near}}]}})
+        };
+        // A pair marked by another game's crate pairs the same way.
+        let doc = json!({"nodes": [mark("mygame::level::RenderLod", "Rock", true),
+                                   mark("mygame::level::RenderLod", "Rock_LOD1", false)]});
+        assert!(run(doc).is_empty());
+        // A key from some other path is not a marker: no pairing error.
+        let doc = json!({"nodes": [mark("demo::props::RenderLod", "Rock", true)]});
+        assert!(run(doc).is_empty());
     }
 }

@@ -121,9 +121,9 @@ impl Default for Budget {
 }
 
 impl Budget {
-    /// Mobile-profile budget for one asset class: HLL art direction
-    /// (heroes 5k-15k tris, 512-1024 px textures) tightened for
-    /// phone-class GPUs. Heroes allow the full 160-bone rigforge rig;
+    /// Mobile-profile budget for one asset class, sized for
+    /// phone-class GPUs: a mid-poly stylized hero is 5k-15k tris with
+    /// 512-1024 px textures. Heroes allow the full 160-bone rigforge rig;
     /// NPCs get rigforge's MOBILE profile (65 deform bones: no face,
     /// no twists); monsters
     /// may exceed heroes (one large boss draw, not a crowd); props
@@ -789,8 +789,8 @@ fn check_pieces(json: &Value, bin: &[u8], out: &mut Vec<(&'static str, String)>)
     }
 }
 
-/// Weapons hang off a hand socket on the character (HLL snaps them to
-/// `Socket_Hand_R` every frame): the weapon file carries no skin, and
+/// Weapons hang off a hand socket on the character (the game snaps them
+/// to `Socket_Hand_R` every frame): the weapon file carries no skin, and
 /// its origin is the grip. Class-gated: only a `--class weapon` run
 /// knows the file is a weapon. (The Godot-era `ATTACH-*` grip node,
 /// `P_WEAPON_ATTACH`, is gone with Godot.)

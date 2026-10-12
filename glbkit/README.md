@@ -22,7 +22,7 @@ a differential oracle.
 glbkit = { git = "https://github.com/chris-straka/rfcheck.git", rev = "<sha>" }
 ```
 
-Pin a `rev`, same as other cross-repo git deps here (`af-bevy` in HLL).
+Pin a `rev`, same as other cross-repo git deps here (e.g. `af-bevy` in a game).
 
 ## Compatibility gates
 
