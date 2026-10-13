@@ -827,9 +827,7 @@ mod tests {
         assert!(!is_render_lod_key("a::b::level::RenderLod"));
         assert!(!is_render_lod_key("demo::level::RenderLodX"));
         assert!(!is_render_lod_key("level::RenderLod"));
-        let mark = |k: &str, name: &str, near: bool| {
-            json!({"name": name, "extras": {"skein": [{k: {"near": near}}]}})
-        };
+        let mark = |k: &str, name: &str, near: bool| json!({"name": name, "extras": {"skein": [{k: {"near": near}}]}});
         // A pair marked by another game's crate pairs the same way.
         let doc = json!({"nodes": [mark("mygame::level::RenderLod", "Rock", true),
                                    mark("mygame::level::RenderLod", "Rock_LOD1", false)]});
