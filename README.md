@@ -25,7 +25,7 @@ Budget (`P_*`) findings are warnings: they print like findings but
 never fail, so exit stays 0 unless a contract layer also fires.
 
 GLB parsing and the shared rig rules live in [`glbkit/`](glbkit/README.md),
-a zero-dependency crate that weightforge and wrapforge also use.
+a zero-dependency crate that meshweights and wrapforge also use.
 
 ## Contract (v6)
 
