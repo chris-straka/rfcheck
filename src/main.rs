@@ -22,6 +22,7 @@ fn print_help() {
     println!(
         "usage: rfcheck [--json] [--mobile] [--budget file] [--class name]\n\
          \x20             [--image-codecs list] [--] file.glb ...\n\
+         \x20      rfcheck --print-budget [--class name] [--budget file]\n\
          \n\
          Check each GLB against the rigforge export contract and print\n\
          one `CODE path: detail` line per finding (OK line when clean).\n\
@@ -32,7 +33,9 @@ fn print_help() {
          weapon, level): per-class mobile budgets, and prop/weapon/level\n\
          files may be unrigged. Implies budget checks, like --budget.\n\
          --image-codecs list sets the texture codecs the game's Bevy build\n\
-         decodes (default png,ktx2; also jpeg, webp, dds, hdr)."
+         decodes (default png,ktx2; also jpeg, webp, dds, hdr).\n\
+         --print-budget prints one class's budget as JSON and exits: the\n\
+         one place tools read a class's triangle budget from."
     );
 }
 
@@ -45,6 +48,7 @@ fn main() -> ExitCode {
     let mut codecs: Vec<&'static str> = bevy::DEFAULT_CODECS.to_vec();
     let mut files: Vec<&str> = Vec::new();
     let mut only_files = false;
+    let mut print_budget = false;
     let mut i = 0;
     while i < raw.len() {
         let a = &raw[i];
@@ -56,6 +60,8 @@ fn main() -> ExitCode {
             json_out = true;
         } else if a == "--mobile" {
             want_budget = true;
+        } else if a == "--print-budget" {
+            print_budget = true;
         } else if a == "--budget" {
             i += 1;
             match raw.get(i) {
@@ -107,6 +113,29 @@ fn main() -> ExitCode {
             files.push(a);
         }
         i += 1;
+    }
+    if print_budget {
+        let set = match &budget_path {
+            Some(p) => match budget::load_budget_set(Path::new(p)) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("rfcheck: {e}");
+                    return ExitCode::from(2);
+                }
+            },
+            None => budget::BudgetSet::mobile(),
+        };
+        let b = set.for_class(class);
+        println!(
+            "{{\"class\": \"{}\", \"max_tris_per_mesh\": {}, \"max_verts_per_mesh\": {}, \"max_texture_dim\": {}, \"max_influences\": {}, \"max_bones\": {}}}",
+            class.map(|c| c.name()).unwrap_or("generic"),
+            b.max_tris_per_mesh,
+            b.max_verts_per_mesh,
+            b.max_texture_dim,
+            b.max_influences,
+            b.max_bones
+        );
+        return ExitCode::SUCCESS;
     }
     if files.is_empty() {
         eprintln!("rfcheck: no input files (see --help)");

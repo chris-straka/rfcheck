@@ -184,14 +184,18 @@ Defaults target a 2024 flagship (Samsung Galaxy S24 class floor):
 
 `--class hero|npc|monster|prop|weapon|level` checks the file against that
 class's mobile-profile budget instead of the generic flagship one.
-Class runs name the class in each warn (`exceed 15000 hero budget`),
+Class runs name the class in each warn (`exceed 25000 hero budget`),
 in the summary (`, class hero`), and in JSON (`"class"` key, present
 only for classed runs). `--class` implies budget checks, like
-`--budget`.
+`--budget`. `rfcheck --print-budget --class NAME` prints one class's
+budget as JSON: tools read a class's budget from there, never a copy.
+The hero's 25,000 triangles were set on 2026-11-19 by the orchestrating
+session for HLH's hero (one body always on screen, a Mac-first game, his
+face at talk distance; 15,000 is what cost him his face).
 
 | Class | Tris | Verts | Tex px | Infl | Bones |
 | --- | --- | --- | --- | --- | --- |
-| `hero` | 15,000 | 10,000 | 1024 | 4 | 160 |
+| `hero` | 25,000 | 16,667 | 1024 | 4 | 160 |
 | `npc` | 8,000 | 6,000 | 512 | 4 | 65 |
 | `monster` | 20,000 | 12,000 | 1024 | 4 | 128 |
 | `prop` | 2,000 | 1,500 | 512 | 4 | 64 |

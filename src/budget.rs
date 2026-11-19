@@ -130,9 +130,17 @@ impl Budget {
     /// and weapons are small static draws.
     pub fn mobile_for(class: AssetClass) -> Self {
         match class {
+            // 25,000 triangles (15,000 before), set 2026-11-19 by the
+            // orchestrating session (FABLE) for HLH's hero: one body, always
+            // on screen, on a Mac-first game; his face at talk distance is
+            // what the owner judged, and the 11-11 cut that met 15,000 is what
+            // ruined it. The head and hair are never thinned to meet it. The
+            // vertex limit follows the triangles (two thirds, as before).
+            // The route reads this (`rfcheck --print-budget --class hero`),
+            // never a copy.
             AssetClass::Hero => Budget {
-                max_tris_per_mesh: 15_000,
-                max_verts_per_mesh: 10_000,
+                max_tris_per_mesh: 25_000,
+                max_verts_per_mesh: 16_667,
                 max_texture_dim: 1024,
                 max_influences: 4,
                 max_bones: 160,
@@ -427,7 +435,7 @@ fn img_tag(images: &[Value], ii: usize) -> String {
 }
 
 /// "hero " for classed runs, "" unclassed: classed warns name the
-/// class whose budget fired ("exceed 15000 hero budget").
+/// class whose budget fired ("exceed 25000 hero budget").
 fn class_tag(class: Option<AssetClass>) -> String {
     match class {
         Some(c) => format!("{} ", c.name()),
@@ -1121,7 +1129,7 @@ mod tests {
         use AssetClass::*;
         assert_eq!(
             ceilings(&Budget::mobile_for(Hero)),
-            (15_000, 10_000, 1024, 4, 160)
+            (25_000, 16_667, 1024, 4, 160)
         );
         assert_eq!(
             ceilings(&Budget::mobile_for(Npc)),
@@ -1199,7 +1207,7 @@ mod tests {
         let hero = set.for_class(Some(Hero));
         assert_eq!(hero.max_bones, 100);
         assert_eq!(hero.max_texture_dim, 1024); // top-level beats class default
-        assert_eq!(hero.max_tris_per_mesh, 15_000); // hero default kept
+        assert_eq!(hero.max_tris_per_mesh, 25_000); // hero default kept
     }
 
     #[test]

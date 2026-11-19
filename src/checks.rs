@@ -1190,9 +1190,9 @@ mod tests {
     #[test]
     fn class_hero_mesh_budget_names_class() {
         use budget::AssetClass::Hero;
-        // Over both hero ceilings (15k tris, 10k verts), under the
+        // Over both hero ceilings (25k tris, 16,667 verts), under the
         // generic flagship ones: only a classed run warns.
-        let (mut doc, bin) = mesh_budget_doc(12_000, 48_000);
+        let (mut doc, bin) = mesh_budget_doc(18_000, 81_000);
         // A normal map, so the test isolates mesh budgets (heroes
         // without one earn P_TEX_NORMAL, covered separately).
         doc["materials"] = json!([{"normalTexture": {"index": 0}}]);
@@ -1201,11 +1201,11 @@ mod tests {
         assert!(r.diags.is_empty(), "must not fail: {:?}", diags_str(&r));
         assert_eq!(wcodes(&r), vec!["P_VERTS", "P_TRIS"]);
         let v = warn_for(&r, "P_VERTS").unwrap();
-        assert!(v.contains("12000 verts"), "no count: {v}");
-        assert!(v.contains("10000 hero budget"), "no class budget: {v}");
+        assert!(v.contains("18000 verts"), "no count: {v}");
+        assert!(v.contains("16667 hero budget"), "no class budget: {v}");
         let t = warn_for(&r, "P_TRIS").unwrap();
-        assert!(t.contains("16000 tris"), "no count: {t}");
-        assert!(t.contains("15000 hero budget"), "no class budget: {t}");
+        assert!(t.contains("27000 tris"), "no count: {t}");
+        assert!(t.contains("25000 hero budget"), "no class budget: {t}");
         assert!(r.summary.contains("class hero"), "summary: {}", r.summary);
         let j: Value = serde_json::from_str(&r.to_json(Path::new("hero.glb"))).unwrap();
         assert_eq!(j["class"], json!("hero"));
