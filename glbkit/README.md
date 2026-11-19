@@ -27,6 +27,6 @@ Pin a `rev`, same as other cross-repo git deps here (e.g. `af-bevy` in a game).
 ## Compatibility gates
 
 `compat/` holds the checks that GLBs written through glbkit load in the
-tools the games use: a headless Bevy 0.19 loader (`compat/bevy`) and a
+tools the games use: a headless Bevy 0.20 loader (`compat/bevy`) and a
 headless Blender import (`compat/blender_import.py`). See
 `compat/README.md`.
