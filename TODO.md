@@ -24,7 +24,7 @@
       grip node) for `--class weapon`; prop/weapon runs may be
       unrigged.
 
-## Requested 2026-10-06: Bevy re-plan (games are Bevy 0.19)
+## Requested 2026-10-06: Bevy re-plan (the Bevy the games ran then, before 0.20)
 
 - [x] Drop Godot-only checks: `P_WEAPON_ATTACH` (`ATTACH-*` grip node for
       Godot `BoneAttachment3D`) removed; weapons snap to the hand socket.
@@ -52,7 +52,8 @@ confirmed against Bevy's loader (glbkit/compat/README.md).
 
 ### Open
 
-- [ ] Owner decision (Decisions, 2026-10-06): a game's bake-off bone names
+- [ ] Owner decision (2026-10-06, waits on the owner's call in the
+      chat): a game's bake-off bone names
       (`Hips`, `Hand_R`, ...) vs rigforge `DEF-*`. Until then
       that hero rig keeps `R_JOINT_PREFIX` / `R_ANIM_TARGET`.
 - [ ] gk (games/_tools, not this repo): fail on `B_*` and `L_*`, not only

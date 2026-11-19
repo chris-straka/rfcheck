@@ -3,7 +3,7 @@
 //!
 //! Blender (rigforge) makes the GLBs; rfcheck verifies them:
 //! container parses, DEF-only skeleton, animations target DEF joints,
-//! and Bevy 0.19's glTF loader takes the file whole. See README.md.
+//! and Bevy 0.20's glTF loader takes the file whole. See README.md.
 
 mod bevy;
 mod budget;

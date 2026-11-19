@@ -30,7 +30,7 @@ Imports each file, checks vertex groups (weighted verts sum to 1 within
 1e-3, max influences), and with `--export-dir` re-exports through
 Blender's writer for the reverse direction. Exit 1 on any failure.
 
-## Last run (2026-10-04, Bevy 0.19.1, Blender 5.2.1)
+## Last run (2026-10-04, the Bevy the games ran then (before 0.20), Blender 5.2.1)
 
 | Set | Bevy | Blender |
 |---|---|---|

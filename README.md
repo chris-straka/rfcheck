@@ -3,7 +3,7 @@
 Rig-contract checker for game-bound GLBs. Blender (rigforge) makes the
 GLBs; rfcheck verifies them — no Blender needed, so it runs in CI, in
 tests, and against any rigger's output (hello, bake-off). The games are
-Bevy 0.19, so it also checks what Bevy's glTF loader needs (`B_*`), a game's
+Bevy 0.20, so it also checks what Bevy's glTF loader needs (`B_*`), a game's
 distant-mesh markers (`L_*`), and attachment sockets.
 
 ```sh
@@ -20,7 +20,8 @@ cargo build --release
 
 Output is one `CODE path: detail` line per finding, `OK path: summary`
 when clean. Exit 0 = clean, 1 = contract failures, 2 = usage/IO error
-(same shape as `animforge/dcc/export_check.py`, deliberately).
+(the report's shape was modelled on the game export checker the old
+animation tool had, now retired).
 Budget (`P_*`) findings are warnings: they print like findings but
 never fail, so exit stays 0 unless a contract layer also fires.
 
@@ -47,7 +48,7 @@ A game-bound rig GLB must:
   sampler inputs, in-range joint indices, non-empty geometry,
   and agreeing morph-target counts (the `X_*` layer below —
   objective defects, zero false positives by construction),
-- load whole in Bevy 0.19.1's glTF loader (the `B_*` layer below),
+- load whole in Bevy 0.20.0's glTF loader (the `B_*` layer below),
 - pair every `RenderLod` marker (`L_LOD_PAIR`, below).
 
 Skeleton-only exports (no meshes) are valid. Clean files report
@@ -104,9 +105,10 @@ contract above.
 | `P_SOCKET` | `Socket_*` node not under a bone or itself a joint; rigged hero without `Socket_Hand_R` (warn) |
 | `P_LOD_TRIS` | far `_LOD1` mesh not cheaper than its near mesh (warn) |
 
-`D_*` codes mirror `animforge/dcc/export_check.py`, whose container
-checks are deliberately duplicated here (asset hygiene vs rig
-contract are different layers; this tool owns its own parsing).
+`D_*` codes were modelled on the game export checker the old animation
+tool had (now retired), whose container checks were deliberately
+duplicated here (asset hygiene vs rig contract are different layers;
+this tool owns its own parsing).
 
 `P_WEAPON_ATTACH` (Godot `BoneAttachment3D` grip node) was removed in
 v0.6.0: Bevy weapons snap to the character's hand socket instead.
@@ -121,12 +123,14 @@ reads.
 
 ## Bevy loader (`B_*`) and LOD markers (`L_*`)
 
-The games load GLBs through Bevy 0.19.1's `bevy_gltf`. Every `B_*`
+The games load GLBs through Bevy 0.20.0's `bevy_gltf`. Every `B_*`
 code is a file that loader rejects outright (the whole GLB fails) or
 silently loses data from, read off its source, and each is checked
 against the real loader by `examples/bevy_fixtures.rs` +
-`glbkit/compat/bevy` (see "Verification" below). Like `X_*` they
-fail, and fire only on what the JSON proves.
+`glbkit/compat/bevy` (see "Verification" below, and
+`glbkit/compat/README.md`'s
+"rfcheck Bevy layer (2026-11-19, Bevy 0.20.0)" for the proof). Like
+`X_*` they fail, and fire only on what the JSON proves.
 
 - Required extensions: Bevy's glTF build enables
   `KHR_lights_punctual`, `KHR_materials_unlit`, `KHR_texture_transform`,
