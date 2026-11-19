@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! v6: Bevy loader checks (B_* layer) and RenderLod markers (L_*).
 //!
-//! The games load GLBs through Bevy 0.19.1's glTF loader (`bevy_gltf`).
+//! The games load GLBs through Bevy 0.20.0's glTF loader (`bevy_gltf`).
 //! Every B_* code is a file that loader rejects outright or silently
 //! loses data from, read off its source (cited per check), so like X_*
 //! these are FAIL-level and fire only on what the JSON proves.
@@ -17,10 +17,13 @@ use crate::util::{acc_count, arr, as_idx, as_usize, join_names, mesh_tag, plural
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// `extensionsRequired` entries Bevy 0.19.1 accepts: gltf-json's
+/// `extensionsRequired` entries Bevy 0.20.0 accepts: gltf-json's
 /// `ENABLED_EXTENSIONS` for the features `bevy_gltf` turns on. Any other
 /// required extension (Draco, meshopt, KHR_mesh_quantization, basisu,
-/// webp, ...) fails validation and the whole file fails to load.
+/// webp, ...) fails validation and the whole file fails to load. 0.20
+/// also builds gltf with `KHR_materials_specular` (`_volume` was already on):
+/// both are read when used, but neither is in that list, so required they
+/// still fail (fixtures `B_EXT_REQUIRED_specular`, `_volume`).
 pub const BEVY_REQUIRED_OK: &[&str] = &[
     "KHR_lights_punctual",
     "KHR_materials_unlit",
@@ -31,11 +34,12 @@ pub const BEVY_REQUIRED_OK: &[&str] = &[
 ];
 
 /// Image codecs a game's Bevy build decodes by default. A game that
-/// builds Bevy with `default-features = false, features = ["2d", "3d",
-/// "ui"]` gets `png`, `hdr`, and `ktx2` (+ zstd) but not `jpeg`, `webp`, or
-/// `dds`. A texture in a missing codec fails the whole GLB load
-/// ("You may need to add the feature for the file format").
-pub const DEFAULT_CODECS: &[&str] = &["png", "ktx2"];
+/// builds Bevy 0.20 with `default-features = false, features = ["2d", "3d",
+/// "ui"]` gets `png` and `hdr` (`common_api`) and `ktx2` (+ zstd, `3d_api`)
+/// but not `jpeg`, `webp`, or `dds`. A texture in a missing codec fails the
+/// whole GLB load ("You may need to add the feature for the file format").
+/// `hdr` was missing here until the 0.20 check (`ok_image_hdr` loads).
+pub const DEFAULT_CODECS: &[&str] = &["png", "hdr", "ktx2"];
 
 pub const CODEC_NAMES: &str = "png, jpeg, ktx2, webp, dds, hdr";
 
@@ -62,15 +66,18 @@ pub fn is_render_lod_key(key: &str) -> bool {
 pub const LOD_SUFFIX: &str = "_LOD1";
 
 /// Codec name for a glTF image mime type; None when Bevy knows no such
-/// format (it then fails with "invalid image mime type").
+/// format (it then fails with "invalid image mime type"). Bevy 0.20's
+/// `ImageFormat::from_mime_type` lower-cases the type and knows each
+/// format by these names only (`image/jpg` is not one: fixture
+/// `B_IMAGE_CODEC_jpg_alias`).
 fn codec_of_mime(mime: &str) -> Option<&'static str> {
-    match mime {
+    match mime.to_ascii_lowercase().as_str() {
         "image/png" => Some("png"),
-        "image/jpeg" | "image/jpg" => Some("jpeg"),
+        "image/jpeg" => Some("jpeg"),
         "image/ktx2" => Some("ktx2"),
         "image/webp" => Some("webp"),
-        "image/vnd-ms.dds" | "image/x-dds" => Some("dds"),
-        "image/vnd.radiance" | "image/x-hdr" => Some("hdr"),
+        "image/vnd-ms.dds" => Some("dds"),
+        "image/vnd.radiance" => Some("hdr"),
         _ => None,
     }
 }
@@ -273,7 +280,8 @@ fn image_codec_issue(json: &Value, bin: &[u8], im: &Value, allowed: &[&str]) -> 
     }
     let uri = im.get("uri").and_then(Value::as_str)?;
     let codec = if let Some(rest) = uri.strip_prefix("data:") {
-        let m = rest.split([';', ',']).next().unwrap_or("");
+        // Bevy decodes a data URI by the image's own mimeType when it has one.
+        let m = mime.unwrap_or_else(|| rest.split([';', ',']).next().unwrap_or(""));
         match codec_of_mime(m) {
             Some(c) => c,
             None => {
@@ -652,7 +660,7 @@ mod tests {
         let d = only(&codes_of(&doc, &jpg, DEFAULT_CODECS), "B_IMAGE_CODEC");
         assert_eq!(d.len(), 1);
         assert!(d[0].contains("image 0 'albedo': jpeg texture"), "{d:?}");
-        assert!(d[0].contains("decodes png/ktx2"), "{d:?}");
+        assert!(d[0].contains("decodes png/hdr/ktx2"), "{d:?}");
         assert!(codes_of(&doc, &jpg, &["png", "jpeg"]).is_empty());
         // Declared PNG, bytes JPEG: Bevy decodes by mime and fails.
         let doc = image_doc(Some("image/png"), jpg.len());
@@ -677,6 +685,34 @@ mod tests {
         let d = only(&codes_of(&doc, &[], DEFAULT_CODECS), "B_IMAGE_CODEC");
         assert_eq!(d.len(), 2, "{d:?}");
         assert!(d[0].contains("webp") && d[1].contains("jpeg"), "{d:?}");
+    }
+
+    /// Bevy 0.20's `ImageFormat::from_mime_type`: lower-cased, exact names, and the games
+    /// build `hdr` (fixtures ok_image_mime_upper, ok_image_hdr, B_IMAGE_CODEC_jpg_alias).
+    #[test]
+    fn image_mime_names_as_bevy_reads_them() {
+        let png = b"\x89PNG\r\n\x1a\n0000".to_vec();
+        let doc = image_doc(Some("image/PNG"), png.len());
+        assert!(codes_of(&doc, &png, DEFAULT_CODECS).is_empty());
+        let hdr = b"#?RADIANCE\n0000".to_vec();
+        let doc = image_doc(Some("image/vnd.radiance"), hdr.len());
+        assert!(codes_of(&doc, &hdr, DEFAULT_CODECS).is_empty());
+        let jpg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0];
+        for alias in ["image/jpg", "image/x-hdr", "image/x-dds"] {
+            let doc = image_doc(Some(alias), jpg.len());
+            let d = only(
+                &codes_of(&doc, &jpg, &["png", "jpeg", "hdr", "dds"]),
+                "B_IMAGE_CODEC",
+            );
+            assert!(
+                d[0].contains("not an image format Bevy knows"),
+                "{alias}: {d:?}"
+            );
+        }
+        // A data URI is decoded by the image's own mimeType when it has one.
+        let doc = json!({"images": [{"uri": "data:image/png;base64,AAAA", "mimeType": "image/webp"}],
+                         "textures": [{"source": 0}]});
+        assert!(only(&codes_of(&doc, &[], DEFAULT_CODECS), "B_IMAGE_CODEC")[0].contains("webp"));
     }
 
     #[test]

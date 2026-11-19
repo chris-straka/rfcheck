@@ -7,8 +7,10 @@ publish = false
 description = "Loads GLBs through Bevy's glTF loader headless; nonzero exit if any fails"
 
 [dependencies]
-# Same Bevy pin as the games. `jpeg`: AI generators (Tripo, UniRig output) embed JPEG textures.
-bevy = { version = "=0.19.1", features = ["jpeg"] }
+# The games' Bevy, built as they build it (HLH's bevy/Cargo.toml): no default features, the
+# same feature list, so a file loads here exactly when it loads in a game. No `jpeg`: a JPEG
+# texture (Tripo, UniRig output) fails in the games, and rfcheck raises B_IMAGE_CODEC for it.
+bevy = { version = "=0.20.0", default-features = false, features = ["std", "2d", "3d", "ui", "ktx2", "zstd_rust"] }
 
 # Standalone: not part of the rfcheck workspace (Bevy is a heavy build).
 [workspace]

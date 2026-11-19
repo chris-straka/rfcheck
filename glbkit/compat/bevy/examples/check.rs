@@ -1,4 +1,4 @@
-//! `cargo run --release --example check -- a.glb b.glb ...`: load each GLB through Bevy's own
+//! `cargo run --release --example check -- a.glb b.glb ...`: load each GLB through Bevy 0.20's own
 //! glTF loader (headless, no GPU, no window), spawn its default scene, and
 //! report what Bevy built. Exit 1 if any file fails to load, has a mesh
 //! without positions, or declares skins that never become `SkinnedMesh`
@@ -33,7 +33,7 @@ fn main() {
             }
         }
     }
-    println!("{} of {} loaded cleanly in Bevy 0.19.1", files.len() - failed, files.len());
+    println!("{} of {} loaded cleanly in Bevy 0.20.0", files.len() - failed, files.len());
     std::process::exit(if failed == 0 { 0 } else { 1 });
 }
 

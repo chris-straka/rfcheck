@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
-//! `cargo run --example bevy_fixtures -- DIR`: write one clean GLB and one
-//! GLB per Bevy-layer code (B_*, L_*) into DIR, so each rule can be
-//! checked against Bevy's real glTF loader (`glbkit/compat/bevy`).
+//! `cargo run --example bevy_fixtures -- DIR`: write clean GLBs and one
+//! GLB per Bevy-layer case (B_*, L_*) into DIR, so each rule can be
+//! checked against Bevy's real glTF loader (`glbkit/compat/bevy`, Bevy
+//! 0.20.0 built with the games' features).
 //! File names start with the code the file should raise; `ok_*` files
-//! must pass rfcheck and load in Bevy.
+//! must pass rfcheck and load in Bevy. The table of what each must do is
+//! `gates/rfcheck-1/gate.sh`.
 
 use serde_json::{json, Value};
 use std::path::Path;
@@ -17,6 +19,16 @@ const PNG: &[u8] = &[
     0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
 ];
 
+/// 1x1 JPEG (macOS `sips` from the PNG above).
+const JPEG: &[u8] = include_bytes!("one_pixel.jpg");
+
+/// 1x1 Radiance HDR: header, then one flat RGBE pixel (under 8 wide, so not run-length coded).
+fn hdr() -> Vec<u8> {
+    let mut b = b"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 1\n".to_vec();
+    b.extend_from_slice(&[128, 64, 32, 129]);
+    b
+}
+
 fn f32s(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
@@ -27,14 +39,29 @@ fn f32s(v: &[f32]) -> Vec<u8> {
 /// 2: translations (2 x VEC3), 24 B
 /// 3: PNG image
 fn base_bin() -> Vec<u8> {
+    bin_with_image(PNG)
+}
+
+/// The shared layout with other image bytes in view 3.
+fn bin_with_image(image: &[u8]) -> Vec<u8> {
     let mut bin = f32s(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
     bin.extend(f32s(&[0.0, 1.0]));
     bin.extend(f32s(&[0.0, 0.0, 0.0, 0.0, 1.0, 0.0]));
-    bin.extend_from_slice(PNG);
+    bin.extend_from_slice(image);
     while !bin.len().is_multiple_of(4) {
         bin.push(0);
     }
     bin
+}
+
+/// The clean scene with `image` (declared `mime`) as its texture.
+fn with_image(image: &[u8], mime: &str) -> (Value, Vec<u8>) {
+    let bin = bin_with_image(image);
+    let mut d = base();
+    d["images"][0]["mimeType"] = json!(mime);
+    d["bufferViews"][3]["byteLength"] = json!(image.len());
+    d["buffers"][0]["byteLength"] = json!(bin.len());
+    (d, bin)
 }
 
 /// Clean scene: Root -> Bone, Mesh (textured triangle); clip "idle"
@@ -108,6 +135,44 @@ fn main() {
     d["extensionsUsed"] = json!(["KHR_draco_mesh_compression"]);
     d["extensionsRequired"] = json!(["KHR_draco_mesh_compression"]);
     files.push(("B_EXT_REQUIRED", d, bin.clone()));
+
+    // Bevy 0.20 builds gltf with KHR_materials_specular (new) and _volume: it reads them, but
+    // gltf-json's validation still accepts neither as required (ENABLED_EXTENSIONS).
+    let mut d = base();
+    d["extensionsUsed"] = json!(["KHR_materials_specular"]);
+    d["materials"][0]["extensions"] = json!({"KHR_materials_specular": {"specularFactor": 0.5}});
+    files.push(("ok_ext_used_specular", d, bin.clone()));
+
+    for ext in ["specular", "volume"] {
+        let name = format!("KHR_materials_{ext}");
+        let mut d = base();
+        d["extensionsUsed"] = json!([name]);
+        d["extensionsRequired"] = json!([name]);
+        let mut e = serde_json::Map::new();
+        e.insert(name.clone(), json!({}));
+        d["materials"][0]["extensions"] = Value::Object(e);
+        files.push((
+            if ext == "specular" {
+                "B_EXT_REQUIRED_specular"
+            } else {
+                "B_EXT_REQUIRED_volume"
+            },
+            d,
+            bin.clone(),
+        ));
+    }
+
+    // Image types: Bevy picks the decoder from the mime type, lower-cased, by exact name, and
+    // decodes only the formats its features build (the games: png, hdr, ktx2).
+    let (d, b) = with_image(&hdr(), "image/vnd.radiance");
+    files.push(("ok_image_hdr", d, b));
+    let mut d = base();
+    d["images"][0]["mimeType"] = json!("image/PNG");
+    files.push(("ok_image_mime_upper", d, bin.clone()));
+    let (d, b) = with_image(JPEG, "image/jpeg");
+    files.push(("B_IMAGE_CODEC_jpeg", d, b));
+    let (d, b) = with_image(JPEG, "image/jpg");
+    files.push(("B_IMAGE_CODEC_jpg_alias", d, b));
 
     let mut d = base();
     d["meshes"][0]["primitives"][0]["mode"] = json!(6);

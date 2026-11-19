@@ -33,7 +33,7 @@ fn print_help() {
          weapon, level): per-class mobile budgets, and prop/weapon/level\n\
          files may be unrigged. Implies budget checks, like --budget.\n\
          --image-codecs list sets the texture codecs the game's Bevy build\n\
-         decodes (default png,ktx2; also jpeg, webp, dds, hdr).\n\
+         decodes (default png,hdr,ktx2; also jpeg, webp, dds).\n\
          --print-budget prints one class's budget as JSON and exits: the\n\
          one place tools read a class's triangle budget from."
     );
