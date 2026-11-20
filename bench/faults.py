@@ -187,9 +187,9 @@ def f_fan(j, b):
 
 
 def f_flipped_normal(j, b):
-    """Flip triangle winding on a 3% patch of the largest indexed triangle
+    """Flip triangle winding on a 0.5% patch of the largest indexed triangle
     primitive (or negate normals when unindexed) so geometric face normals
-    oppose exported vertex normals."""
+    oppose exported vertex normals near the 0.2% detection threshold."""
     cands = [
         p for m in j.get("meshes", []) for p in m.get("primitives", [])
         if p.get("mode", 4) == 4 and "POSITION" in p.get("attributes", {}) and "NORMAL" in p.get("attributes", {})
@@ -202,7 +202,7 @@ def f_flipped_normal(j, b):
         n_tris = j["accessors"][acc]["count"] // 3
         if n_tris < 3:
             return False
-        flip_n = max(5, min(n_tris, (n_tris * 3 + 99) // 100))
+        flip_n = max(3, min(n_tris, (n_tris * 5 + 999) // 1000))
         for t in range(flip_n):
             off1, f1 = elem(j, acc, 3 * t + 1, 0)
             off2, f2 = elem(j, acc, 3 * t + 2, 0)
@@ -215,7 +215,7 @@ def f_flipped_normal(j, b):
     if j["accessors"][acc]["componentType"] != 5126:
         return False
     n = j["accessors"][acc]["count"]
-    flip_v = max(9, min(n, (n * 3 + 99) // 100))
+    flip_v = max(9, min(n, (n * 5 + 999) // 1000))
     for i in range(flip_v):
         for k in range(3):
             off, _ = elem(j, acc, i, k)
@@ -223,10 +223,42 @@ def f_flipped_normal(j, b):
     return True
 
 
+def f_inside_out_shell(j, b):
+    """Flip BOTH triangle winding and exported normals across the largest
+    indexed triangle primitive so normal-vs-winding agrees 100% and only the
+    closed-shell signed-volume check catches the inside-out mesh."""
+    cands = [
+        p for m in j.get("meshes", []) for p in m.get("primitives", [])
+        if p.get("mode", 4) == 4 and "indices" in p and "POSITION" in p.get("attributes", {})
+    ]
+    if not cands:
+        return False
+    p = max(cands, key=lambda pr: j["accessors"][pr["attributes"]["POSITION"]]["count"])
+    acc = p["indices"]
+    n_tris = j["accessors"][acc]["count"] // 3
+    if n_tris < 4:
+        return False
+    for t in range(n_tris):
+        off1, f1 = elem(j, acc, 3 * t + 1, 0)
+        off2, f2 = elem(j, acc, 3 * t + 2, 0)
+        v1 = struct.unpack_from("<" + f1, b, off1)[0]
+        v2 = struct.unpack_from("<" + f2, b, off2)[0]
+        struct.pack_into("<" + f1, b, off1, v2)
+        struct.pack_into("<" + f2, b, off2, v1)
+    nrm_acc = p["attributes"].get("NORMAL")
+    if nrm_acc is not None and j["accessors"][nrm_acc]["componentType"] == 5126:
+        for i in range(j["accessors"][nrm_acc]["count"]):
+            for k in range(3):
+                off, _ = elem(j, nrm_acc, i, k)
+                struct.pack_into("<f", b, off, -struct.unpack_from("<f", b, off)[0])
+    return True
+
+
 FAULTS = [("W_UNNORMALIZED", f_unnormalized), ("X_JOINT_RANGE", f_joint_range), ("W_OVER_INFLUENCE", f_over_influence),
           ("R_JOINT_PREFIX", f_prefix), ("R_JOINT_INDEX", f_joint_index), ("R_NO_SKIN", f_no_skin),
           ("B_NODE_CYCLE", f_cycle), ("X_ANIM_NAN", f_anim_nan), ("B_CLIP_NAME", f_clip_name),
-          ("X_ACCESSOR_BOUNDS", f_bounds), ("B_PRIM_MODE", f_fan), ("M_FLIPPED_NORMAL", f_flipped_normal)]
+          ("X_ACCESSOR_BOUNDS", f_bounds), ("B_PRIM_MODE", f_fan),
+          ("M_FLIPPED_NORMAL", f_flipped_normal), ("M_FLIPPED_NORMAL:inside_out", f_inside_out_shell)]
 
 
 def check(path):
@@ -272,7 +304,8 @@ def main():
             write(m, j, b)
             rc2, codes2, dt2 = check(m)
             times.append(dt2)
-            rows.append({"file": os.path.relpath(f, os.path.expanduser("~")), "fault": code, "detected": code in codes2,
+            expected = code.split(":")[0]
+            rows.append({"file": os.path.relpath(f, os.path.expanduser("~")), "fault": code, "detected": expected in codes2,
                          "exit": rc2, "codes": codes2})
     det = {}
     for r in rows:

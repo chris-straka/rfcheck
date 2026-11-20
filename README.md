@@ -85,7 +85,7 @@ contract above.
 | `X_EMPTY_MESH` | mesh with no primitives or zero vertices |
 | `X_EMPTY_PRIM` | primitive with zero vertices and zero indices |
 | `X_MORPH_COUNT` | morph weights/targets/counts disagree |
-| `M_FLIPPED_NORMAL` | mesh primitive has inverted-normal triangles (vertex normals oppose geometric face normal) |
+| `M_FLIPPED_NORMAL` | mesh primitive has inverted-normal triangles (vertex normals oppose geometric face normal) or an inside-out closed shell (negative signed volume) |
 | `B_EXT_REQUIRED` | `extensionsRequired` names an extension Bevy cannot load (Draco, meshopt, quantization, basisu, ...) |
 | `B_PRIM_MODE` | primitive mode LINE_LOOP or TRIANGLE_FAN (Bevy rejects) |
 | `B_NODE_CYCLE` | node hierarchy has a cycle (Bevy needs a tree) |
