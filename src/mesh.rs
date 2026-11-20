@@ -516,10 +516,12 @@ pub fn check_mesh(json: &Value, bin: &[u8]) -> Vec<(&'static str, String)> {
 
 /// Sliver minimum interior angle threshold in degrees.
 const SLIVER_MIN_ANGLE_DEG: f64 = 8.0;
-/// Self-fold dihedral normal dot threshold (`dot < -0.50` => normal bend > 120 deg,
-/// i.e. interior dihedral angle < 60 deg — catches acute fold-back pinches without
-/// false-alarming on 75-90 deg cloth collars, hair valleys, or architectural corners).
+/// Global self-fold dihedral normal dot threshold (`dot < -0.50` => normal bend > 120 deg,
+/// i.e. interior dihedral angle < 60 deg — catches acute fold-back pinches across cloth/hair).
 const SELF_FOLD_MAX_DOT: f64 = -0.50;
+/// Neck-band acute fold threshold (`dot < -0.05` => interior dihedral < 87 deg, catching
+/// Andras-style < 90 deg frozen-ring neck folds even without a reference GLB).
+const NECK_FOLD_MAX_DOT: f64 = -0.05;
 
 #[inline]
 fn read_vec2(bin: &[u8], lay: &Layout, idx: usize) -> Option<[f64; 2]> {
@@ -1142,11 +1144,11 @@ pub fn check_mesh_hygiene(json: &Value, bin: &[u8]) -> Vec<(&'static str, String
                     let charts = us.chart_count();
                     let avg_tris_per_chart = (us.valid_tris as f64) / (charts.max(1) as f64);
 
-                    let bad_aniso = us.aniso_gt8 >= 5 && aniso_pct >= 1.5;
-                    let bad_spread = us.ratios.len() >= 50 && spread > 25.0;
+                    let bad_aniso = (us.aniso_gt8 >= 5 && aniso_pct >= 0.5) || us.aniso_gt8 >= 25;
+                    let bad_spread = us.ratios.len() >= 50 && spread > 10.0;
                     // Only flag zero-UV collapse if the mesh actually uses non-zero UVs elsewhere
                     let has_real_uv = us.ratios.len() >= us.valid_tris / 4;
-                    let bad_zero = has_real_uv && us.zero_uv_tris >= 5 && zero_pct >= 2.0;
+                    let bad_zero = has_real_uv && us.zero_uv_tris >= 5 && zero_pct >= 1.0;
                     // Only flag chart fragmentation when paired with real UV distortion or extreme
                     // triangle-soup shattering (avoids false alarms on clean preserved head/hair atlases).
                     let bad_shred_charts =
@@ -1154,7 +1156,7 @@ pub fn check_mesh_hygiene(json: &Value, bin: &[u8]) -> Vec<(&'static str, String
                             || (us.valid_tris >= 500
                                 && charts > 200
                                 && avg_tris_per_chart < 35.0
-                                && (spread > 8.0 || aniso_pct >= 0.5));
+                                && (spread > 6.0 || aniso_pct >= 0.25));
 
                     if bad_aniso || bad_spread || bad_zero || bad_shred_charts {
                         out.push((
@@ -1235,6 +1237,7 @@ pub fn check_mesh_hygiene(json: &Value, bin: &[u8]) -> Vec<(&'static str, String
         let mut non_manifold_edges = 0usize;
         let mut inconsistent_winding_edges = 0usize;
         let mut self_fold_edges = 0usize;
+        let mut neck_acute_fold_edges = 0usize;
 
         for (&(u, v), edge) in &hb.edges {
             if edge.count == 1 {
@@ -1259,6 +1262,14 @@ pub fn check_mesh_hygiene(json: &Value, bin: &[u8]) -> Vec<(&'static str, String
                     let d = dot(edge.normals[0], edge.normals[1]);
                     if d < SELF_FOLD_MAX_DOT {
                         self_fold_edges += 1;
+                    }
+                    if !open_sheet_name
+                        && is_humanoid
+                        && edge.mid_y >= neck_lo
+                        && edge.mid_y <= neck_hi
+                        && d < NECK_FOLD_MAX_DOT
+                    {
+                        neck_acute_fold_edges += 1;
                     }
                 }
             } else if edge.count > 2 {
@@ -1357,18 +1368,20 @@ pub fn check_mesh_hygiene(json: &Value, bin: &[u8]) -> Vec<(&'static str, String
             ));
         }
 
-        // Self-folds (acute fold-back creases on manifold edges).
+        // Self-folds: acute <60 deg fold-back creases globally OR <90 deg folds in the neck band.
         let fold_pct = if total_edges > 0 {
             (self_fold_edges as f64) * 100.0 / (total_edges as f64)
         } else {
             0.0
         };
-        if self_fold_edges >= 3 && (fold_pct >= 0.2 || self_fold_edges >= 15) {
+        let bad_global_fold = self_fold_edges >= 3 && (fold_pct >= 0.2 || self_fold_edges >= 15);
+        let bad_neck_fold = neck_acute_fold_edges >= 3;
+        if bad_global_fold || bad_neck_fold {
             out.push((
                 "M_FOLD",
                 format!(
                     "{mtag}: {self_fold_edges} acute self-fold manifold edges ({fold_pct:.2}%, \
-                     dihedral < 60 deg)"
+                     dihedral < 60 deg; neck <90 deg folds={neck_acute_fold_edges})"
                 ),
             ));
         }
@@ -2096,5 +2109,103 @@ mod tests {
         let bad_glb = build_uv_mesh_glb("PlaneShred", &pos, Some(&uv_bad), &idx);
         assert!(warn_codes(&bad_glb).contains(&"M_UV_SHRED"));
         assert!(strict_codes(&bad_glb).contains(&"M_UV_SHRED"));
+    }
+
+    #[test]
+    fn planted_neck_lt90_fold_strictly_fails() {
+        // Build a 1.75m closed humanoid and plant a ~75 deg acute fold (between 60 and 90 deg!)
+        // directly in the neck band (79% H) — must hard-fail M_FOLD under --strict-mesh.
+        let segs = 16usize;
+        let rings = 18usize;
+        let mut pos: Vec<[f32; 3]> = Vec::new();
+        let mut idx: Vec<u16> = Vec::new();
+        pos.push([0.0, 0.0, 0.0]);
+        for r in 0..=rings {
+            let t = (r as f32) / (rings as f32);
+            let mut y = 0.02 + t * 1.71;
+            let mut rad = if (0.74..=0.84).contains(&t) {
+                0.065
+            } else {
+                0.14
+            };
+            // Plant a sharp ~75 deg inward fold-back tuck right at ring 14 (neck band)
+            if r == 14 {
+                y += 0.12;
+                rad = 0.025;
+            }
+            for s in 0..segs {
+                let a = 2.0 * std::f32::consts::PI * (s as f32) / (segs as f32);
+                pos.push([rad * a.cos(), y, rad * a.sin()]);
+            }
+        }
+        let top_c = pos.len() as u16;
+        pos.push([0.0, 1.75, 0.0]);
+        for s in 0..segs {
+            let a = 1 + s;
+            let b = 1 + (s + 1) % segs;
+            idx.extend_from_slice(&[0, a as u16, b as u16]);
+        }
+        for r in 0..rings {
+            let row0 = 1 + r * segs;
+            let row1 = 1 + (r + 1) * segs;
+            for s in 0..segs {
+                let s1 = (s + 1) % segs;
+                let a = (row0 + s) as u16;
+                let b = (row0 + s1) as u16;
+                let c = (row1 + s1) as u16;
+                let d = (row1 + s) as u16;
+                idx.extend_from_slice(&[a, c, b, a, d, c]);
+            }
+        }
+        let last = 1 + rings * segs;
+        for s in 0..segs {
+            let a = (last + s) as u16;
+            let b = (last + (s + 1) % segs) as u16;
+            idx.extend_from_slice(&[a, top_c, b]);
+        }
+        let glb = build_uv_mesh_glb("Hero_BodyFace", &pos, None, &idx);
+        assert!(
+            strict_codes(&glb).contains(&"M_FOLD"),
+            "planted <90 deg neck fold must hard-fail M_FOLD, got {:?}",
+            strict_codes(&glb)
+        );
+    }
+
+    #[test]
+    fn planted_chest_embroidery_shredded_uvs_strictly_fails() {
+        // 12x12 torso grid (288 tris) with clean UVs except a localized ~10% chest patch
+        // compressed/sheared like shredded chest embroidery (spread > 10x, aniso > 8x).
+        let n = 12usize;
+        let mut pos: Vec<[f32; 3]> = Vec::new();
+        let mut uv_bad: Vec<[f32; 2]> = Vec::new();
+        let mut idx: Vec<u16> = Vec::new();
+        for y in 0..=n {
+            for x in 0..=n {
+                let fx = (x as f32) / (n as f32);
+                let fy = (y as f32) / (n as f32);
+                pos.push([fx * 0.4, 1.0 + fy * 0.4, 0.0]);
+                // Localized chest embroidery shred: compress U by 12x on rows 6..9, cols 4..8
+                if (4..=8).contains(&x) && (6..=9).contains(&y) {
+                    uv_bad.push([0.5 + (fx - 0.5) * 0.06, fy]);
+                } else {
+                    uv_bad.push([fx, fy]);
+                }
+            }
+        }
+        for y in 0..n {
+            for x in 0..n {
+                let a = (y * (n + 1) + x) as u16;
+                let b = a + 1;
+                let c = a + (n + 1) as u16;
+                let d = c + 1;
+                idx.extend_from_slice(&[a, b, d, a, d, c]);
+            }
+        }
+        let glb = build_uv_mesh_glb("TorsoEmbroideryShred", &pos, Some(&uv_bad), &idx);
+        assert!(
+            strict_codes(&glb).contains(&"M_UV_SHRED"),
+            "planted shredded chest embroidery UVs must hard-fail M_UV_SHRED, got {:?}",
+            strict_codes(&glb)
+        );
     }
 }

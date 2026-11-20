@@ -883,7 +883,9 @@ fn check_silhouette_drift(cand: &[Tri], ref_tris: &[Tri], out: &mut Vec<(&'stati
     let zw = (rhi[2] - rlo[2]).max(1e-6);
     let is_full_body = h > 1.35 * zw && h > 1.15 * xw;
     let (center, span) = if is_full_body {
-        ([cx, rlo[1] + 0.875 * h, cz], 0.34 * h)
+        // Match talk-cam head framing (0.775..1.045 H: neck, chin, jaw, ears, hair tips —
+        // excludes armpits/arms/lower cloak projecting into side profile below 0.77 H).
+        ([cx, rlo[1] + 0.910 * h, cz], 0.27 * h)
     } else {
         ([cx, rlo[1] + 0.5 * h, cz], 1.12 * h.max(xw).max(zw))
     };

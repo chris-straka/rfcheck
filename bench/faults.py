@@ -671,6 +671,36 @@ def f_neck_crack(j, b):
     return True
 
 
+def f_neck_lt90_fold(j, b):
+    """Plant an Andras-style < 90 deg acute fold tuck in the neck band (75%..84% H)."""
+    p = largest_indexed_prim(j)
+    if not p:
+        return False
+    pos_acc = p["attributes"]["POSITION"]
+    pos = _read_pos(j, b, pos_acc)
+    ys = [v[1] for v in pos]
+    zs = [v[2] for v in pos]
+    h = max(ys) - min(ys)
+    if h <= 0.3 or h <= 1.2 * (max(zs) - min(zs)):
+        return False
+    ymin = min(ys)
+    # Find one ring near 79% H and tuck it sharply inward + upward to form a ~75 deg crease
+    target_y = ymin + 0.79 * h
+    ring_ys = sorted(set(round(v[1], 4) for v in pos))
+    nearest_y = min(ring_ys, key=lambda yv: abs(yv - target_y))
+    moved = 0
+    for i, (x, y, z) in enumerate(pos):
+        if abs(y - nearest_y) < 0.015 * h:
+            off_x, _ = elem(j, pos_acc, i, 0)
+            off_y, _ = elem(j, pos_acc, i, 1)
+            off_z, _ = elem(j, pos_acc, i, 2)
+            struct.pack_into("<f", b, off_x, x * 0.25)
+            struct.pack_into("<f", b, off_y, y + 0.11 * h)
+            struct.pack_into("<f", b, off_z, z * 0.25)
+            moved += 1
+    return moved >= 6
+
+
 def f_uv_shred(j, b):
     """Stretch and shred UVs (>15x anisotropy) across a patch of vertices."""
     p = largest_indexed_prim(j)
@@ -758,6 +788,7 @@ FAULTS = [
     # Character-conversion defect codes
     ("M_SLIVER", f_sliver, False),
     ("M_FOLD:self", f_self_fold, False),
+    ("M_FOLD:neck_lt90", f_neck_lt90_fold, False),
     ("M_NECK_CRACK", f_neck_crack, False),
     ("M_UV_SHRED", f_uv_shred, False),
     # Reference-compared character-conversion faults
