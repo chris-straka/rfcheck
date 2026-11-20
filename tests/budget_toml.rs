@@ -283,7 +283,10 @@ fn game_budget_dir_argument_and_print_budget() {
 
     // --print-budget accepts either <game>/budget.toml or <game> directory.
     for arg in [budget_file.to_str().unwrap(), game_dir.to_str().unwrap()] {
-        let out = run_rfcheck(&["--print-budget", "--budget", arg, "--class", "monster"], None);
+        let out = run_rfcheck(
+            &["--print-budget", "--budget", arg, "--class", "monster"],
+            None,
+        );
         assert_eq!(
             out.status.code(),
             Some(0),
@@ -357,10 +360,7 @@ fn game_budget_auto_discovers_ancestor_budget_toml() {
         String::from_utf8_lossy(&out.stderr)
     );
     let r = parse_stdout_json(&out);
-    assert!(
-        r.get("warns").is_none(),
-        "plain run must omit warns: {r}"
-    );
+    assert!(r.get("warns").is_none(), "plain run must omit warns: {r}");
 }
 
 #[test]
@@ -370,8 +370,11 @@ fn game_budget_stops_at_game_root_and_keeps_backwards_compatible_defaults() {
     fs::write(tmp.path().join("budget.toml"), SAMPLE_GAME_BUDGET_TOML).expect("write outer budget");
     let other_game = tmp.path().join("other_game");
     fs::create_dir_all(&other_game).expect("create other_game");
-    fs::write(other_game.join("gamekit.toml"), "[game]\nname = \"Other\"\n")
-        .expect("write gamekit.toml");
+    fs::write(
+        other_game.join("gamekit.toml"),
+        "[game]\nname = \"Other\"\n",
+    )
+    .expect("write gamekit.toml");
 
     let glb_18001 = other_game.join("enemies/beast/models/glb/beast_18001.glb");
     let glb_20001 = other_game.join("enemies/beast/models/glb/beast_20001.glb");

@@ -258,12 +258,41 @@ a mesh warns only on provable counts: unknown prims are noted
 (`+N uncounted`) and can only add, so a warn on partial data is
 still sound.
 
-`--budget <file>` overrides any subset of the defaults (missing
+`--budget <path>` overrides any subset of the defaults (missing
 keys keep mobile defaults; unknown keys are an error, so typos fail
-loudly). Format is sniffed from content — a leading `{` means JSON,
-anything else the TOML subset (`key = value` lines with unsigned
-integers — `50_000` digit separators allowed — `#` comments, and
-`[class.X]` sections):
+loudly). `<path>` may be a file (`<game>/budget.toml` or JSON) or a
+game directory containing `budget.toml` (missing `budget.toml` exits 2).
+When `--budget` is omitted on a `--class`, `--mobile`, or
+`--print-budget` run, `rfcheck` walks up from the checked GLB (or the
+working directory for `--print-budget`) to find an ancestor
+`budget.toml`, stopping at the first `gamekit.toml` or `.git` boundary;
+a malformed discovered `budget.toml` exits 2, while a game without one
+keeps the built-in mobile defaults. Format is sniffed from content — a
+leading `{` means JSON, anything else the TOML subset (optional
+top-level `schema = 1`, `key = value` lines with unsigned integers —
+`50_000` digit separators allowed — `#` comments, and `[class.X]`
+sections):
+
+```toml
+# Per-game budget.toml (schema v1)
+schema = 1
+
+[class.hero]
+max_tris_per_mesh = 25_000
+max_verts_per_mesh = 16_667
+max_texture_dim = 1024
+max_influences = 4
+max_bones = 160
+
+[class.monster]
+max_tris_per_mesh = 18_000
+max_verts_per_mesh = 12_000
+max_texture_dim = 1024
+max_influences = 4
+max_bones = 128
+```
+
+Legacy flat TOML (without `schema`) and JSON files keep working unchanged:
 
 ```json
 {"max_tris_per_mesh": 50000, "max_texture_dim": 1024}
@@ -299,8 +328,9 @@ max_bones = 100
  "class": {"hero": {"max_tris_per_mesh": 15000, "max_bones": 100}}}
 ```
 
-Unknown classes, unknown keys, and non-`[class.X]` sections are all
-errors.
+Unsupported `schema` versions, duplicate keys or `[class.X]` sections,
+unknown classes, unknown keys, and non-`[class.X]` sections are all
+errors (exit 2).
 
 ## Roadmap
 

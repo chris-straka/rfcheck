@@ -15,26 +15,29 @@ mod reference;
 mod util;
 mod weights;
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn print_help() {
     println!(
-        "usage: rfcheck [--json] [--mobile] [--budget file] [--class name]\n\
+        "usage: rfcheck [--json] [--mobile] [--budget path] [--class name]\n\
          \x20             [--image-codecs list] [--reference ref.glb] [--strict-mesh]\n\
          \x20             [--] file.glb ...\n\
-         \x20      rfcheck --print-budget [--class name] [--budget file]\n\
+         \x20      rfcheck --print-budget [--class name] [--budget path]\n\
          \n\
          Check each GLB against the rigforge export contract and print\n\
          one `CODE path: detail` line per finding (OK line when clean).\n\
          Exit 0 = clean, 1 = contract failures, 2 = usage/environment error.\n\
          --mobile checks mobile perf budgets too (P_* warnings, never fail).\n\
-         --budget file overrides budget keys via a JSON object or flat TOML.\n\
+         --budget path overrides budget keys via a budget.toml/JSON file or\n\
+         game directory containing budget.toml.\n\
          --class name checks as one asset class (hero, npc, monster, prop,\n\
-         weapon, level): per-class mobile budgets, and prop/weapon/level\n\
-         files may be unrigged. Implies budget checks, like --budget.\n\
+         weapon, level): per-class mobile budgets (auto-discovering an ancestor\n\
+         budget.toml up to gamekit.toml/.git when --budget is omitted), and\n\
+         prop/weapon/level files may be unrigged. Implies budget checks.\n\
          --image-codecs list sets the texture codecs the game's Bevy build\n\
          decodes (default png,hdr,ktx2; also jpeg, webp, dds).\n\
          --reference ref.glb compares surface folds (>35 deg) and talk-cam\n\
@@ -134,15 +137,19 @@ fn main() -> ExitCode {
         i += 1;
     }
     if print_budget {
-        let set = match &budget_path {
-            Some(p) => match budget::load_budget_set(Path::new(p)) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("rfcheck: {e}");
-                    return ExitCode::from(2);
-                }
+        let set_res = match budget_path {
+            Some(p) => budget::load_budget_set(Path::new(p)),
+            None => match env::current_dir() {
+                Ok(cwd) => budget::load_budget_for_path(None, &cwd),
+                Err(_) => Ok(budget::BudgetSet::mobile()),
             },
-            None => budget::BudgetSet::mobile(),
+        };
+        let set = match set_res {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("rfcheck: {e}");
+                return ExitCode::from(2);
+            }
         };
         let b = set.for_class(class);
         println!(
@@ -165,7 +172,7 @@ fn main() -> ExitCode {
     if class.is_some() {
         want_budget = true;
     }
-    let budgets: Option<budget::BudgetSet> = match &budget_path {
+    let explicit_budgets: Option<budget::BudgetSet> = match budget_path {
         Some(p) => match budget::load_budget_set(Path::new(p)) {
             Ok(b) => Some(b),
             Err(e) => {
@@ -173,7 +180,6 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         },
-        None if want_budget => Some(budget::BudgetSet::mobile()),
         None => None,
     };
 
@@ -193,15 +199,37 @@ fn main() -> ExitCode {
         strict_mesh,
         reference: ref_bytes.as_deref(),
     };
+    let default_budgets = budget::BudgetSet::mobile();
+    let mut discovered_cache: BTreeMap<PathBuf, budget::BudgetSet> = BTreeMap::new();
     let mut failed = false;
     for f in &files {
         let path = Path::new(f);
+        let file_budget: Option<&budget::Budget> = if let Some(ref set) = explicit_budgets {
+            Some(set.for_class(class))
+        } else if want_budget {
+            match budget::discover_budget_file(path) {
+                Some(found) => {
+                    if !discovered_cache.contains_key(&found) {
+                        match budget::load_budget_set(&found) {
+                            Ok(set) => {
+                                discovered_cache.insert(found.clone(), set);
+                            }
+                            Err(e) => {
+                                eprintln!("rfcheck: {e}");
+                                return ExitCode::from(2);
+                            }
+                        }
+                    }
+                    discovered_cache.get(&found).map(|s| s.for_class(class))
+                }
+                None => Some(default_budgets.for_class(class)),
+            }
+        } else {
+            None
+        };
         let report = match fs::read(path) {
             Err(e) => checks::Report::unreadable(format!("cannot read file: {e}"), class),
-            Ok(bytes) => {
-                let b = budgets.as_ref().map(|s| s.for_class(class));
-                checks::check_glb_with_opts(&bytes, b, class, &opts)
-            }
+            Ok(bytes) => checks::check_glb_with_opts(&bytes, file_budget, class, &opts),
         };
         if json_out {
             println!("{}", report.to_json(path));

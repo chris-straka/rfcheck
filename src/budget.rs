@@ -16,7 +16,13 @@ use crate::weights::SkinStats;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Canonical per-game budget filename discovered from game roots and
+/// directories passed to `--budget`.
+pub const GAME_BUDGET_FILE: &str = "budget.toml";
+/// Supported per-game `budget.toml` schema version (`schema = 1`).
+pub const BUDGET_SCHEMA_VERSION: u64 = 1;
 
 /// Single character draw call on a 2024 flagship: engines ship
 /// mobile heroes at 50-100k tris (Unity URP / UE5 mobile guidance).
@@ -44,7 +50,7 @@ pub const BUDGET_KEYS: &str = "max_tris_per_mesh, max_verts_per_mesh, \
 /// Asset class for per-class budgets (`--class`). Heroes are the
 /// player cast, NPCs background humanoids, monsters creatures and
 /// bosses, props static kit pieces, weapons hand-held props.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AssetClass {
     Hero,
     Npc,
@@ -99,6 +105,7 @@ impl AssetClass {
 }
 
 /// Perf budget: every field is a "warn above this" ceiling.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Budget {
     pub max_tris_per_mesh: usize,
     pub max_verts_per_mesh: usize,
@@ -216,6 +223,7 @@ impl Budget {
 /// first, then the file top level, then its mobile-profile default —
 /// so an old flat file keeps meaning "every asset", and a section
 /// only narrows its own class.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BudgetSet {
     pub generic: Budget,
     hero: Budget,
@@ -309,6 +317,17 @@ fn parse_json_budget(text: &str) -> Result<FileBudget, String> {
         sections: Vec::new(),
     };
     for (k, v) in obj {
+        if k == "schema" {
+            let n = v.as_u64().ok_or_else(|| {
+                format!("budget key 'schema': expected integer {BUDGET_SCHEMA_VERSION}")
+            })?;
+            if n != BUDGET_SCHEMA_VERSION {
+                return Err(format!(
+                    "unsupported budget schema version {n} (expected {BUDGET_SCHEMA_VERSION})"
+                ));
+            }
+            continue;
+        }
         if k == "class" {
             let classes = v
                 .as_object()
@@ -341,16 +360,21 @@ fn parse_json_budget(text: &str) -> Result<FileBudget, String> {
     Ok(fb)
 }
 
-/// Flat `key = value` subset plus `[class.X]` sections: blank lines,
+/// Per-game `budget.toml` subset: optional top-level `schema = 1`,
+/// flat `key = value` overrides, and `[class.X]` sections; blank lines,
 /// `#` comments (full-line or trailing), unsigned integers. No other
-/// sections, no tables, no strings — a budget file holds numbers, and
-/// anything else is a typo.
+/// sections, no tables, no strings, no duplicate keys or sections — a
+/// budget file holds numbers, and anything else is a typo.
 fn parse_toml_budget(text: &str) -> Result<FileBudget, String> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut fb = FileBudget {
         top: Vec::new(),
         sections: Vec::new(),
     };
     let mut section: Option<AssetClass> = None;
+    let mut seen_sections: BTreeSet<AssetClass> = BTreeSet::new();
+    let mut seen_top_keys: BTreeSet<String> = BTreeSet::new();
+    let mut seen_section_keys: BTreeSet<String> = BTreeSet::new();
     for (ln, raw) in text.lines().enumerate() {
         let tag = format!("budget line {}", ln + 1);
         // No strings in this subset, so `#` always starts a comment —
@@ -368,9 +392,14 @@ fn parse_toml_budget(text: &str) -> Result<FileBudget, String> {
                 format!("{tag}: [{inner}] unsupported (only [class.X], X in {CLASS_NAMES})")
             })?;
             let cn = cn.trim();
-            section = Some(parse_class(cn).ok_or_else(|| {
+            let c = parse_class(cn).ok_or_else(|| {
                 format!("{tag}: unknown asset class '{cn}' (expected {CLASS_NAMES})")
-            })?);
+            })?;
+            if !seen_sections.insert(c) {
+                return Err(format!("{tag}: duplicate section [class.{}]", c.name()));
+            }
+            seen_section_keys.clear();
+            section = Some(c);
             continue;
         }
         let (k, v) = line
@@ -395,9 +424,27 @@ fn parse_toml_budget(text: &str) -> Result<FileBudget, String> {
             .replace('_', "")
             .parse()
             .map_err(|_| format!("{tag}: value for '{key}' overflows"))?;
+        if section.is_none() && key == "schema" {
+            if !seen_top_keys.insert(key.to_string()) {
+                return Err(format!("{tag}: duplicate budget key '{key}'"));
+            }
+            if n != BUDGET_SCHEMA_VERSION {
+                return Err(format!(
+                    "{tag}: unsupported budget schema version {n} (expected {BUDGET_SCHEMA_VERSION})"
+                ));
+            }
+            continue;
+        }
         Budget::default()
             .set(key, n)
             .map_err(|e| format!("{tag}: {e}"))?;
+        let seen = match section {
+            None => &mut seen_top_keys,
+            Some(_) => &mut seen_section_keys,
+        };
+        if !seen.insert(key.to_string()) {
+            return Err(format!("{tag}: duplicate budget key '{key}'"));
+        }
         match section {
             None => fb.top.push((key.to_string(), n)),
             Some(c) => fb.sections.push((c, key.to_string(), n)),
@@ -410,17 +457,88 @@ fn parse_toml_budget(text: &str) -> Result<FileBudget, String> {
 /// `{` means JSON, anything else the TOML subset). Missing keys keep
 /// their mobile defaults (generic or per-class).
 pub fn parse_budget_set(text: &str) -> Result<BudgetSet, String> {
-    let fb = if text.trim_start().starts_with('{') {
-        parse_json_budget(text)
+    let trimmed = text.strip_prefix('\u{feff}').unwrap_or(text).trim_start();
+    let fb = if trimmed.starts_with('{') {
+        parse_json_budget(trimmed)
     } else {
         parse_toml_budget(text)
     }?;
     fb.build()
 }
 
+/// Resolve an explicit `--budget` argument to its file path. If `path` is a
+/// directory, resolves `<path>/budget.toml` and errors if missing.
+pub fn resolve_budget_path(path: &Path) -> Result<PathBuf, String> {
+    if path.is_dir() {
+        let candidate = path.join(GAME_BUDGET_FILE);
+        if candidate.is_file() {
+            Ok(candidate)
+        } else {
+            Err(format!(
+                "no {GAME_BUDGET_FILE} found in budget directory '{}'",
+                path.display()
+            ))
+        }
+    } else {
+        Ok(path.to_path_buf())
+    }
+}
+
 pub fn load_budget_set(path: &Path) -> Result<BudgetSet, String> {
-    let text = fs::read_to_string(path).map_err(|e| format!("cannot read budget file: {e}"))?;
-    parse_budget_set(&text)
+    let resolved = resolve_budget_path(path)?;
+    let text = fs::read_to_string(&resolved)
+        .map_err(|e| format!("cannot read budget file '{}': {e}", resolved.display()))?;
+    parse_budget_set(&text).map_err(|e| format!("{}: {e}", resolved.display()))
+}
+
+/// Walk up from `start` (a GLB file or directory) to find a game's
+/// `budget.toml`. Stops at the first game/repo root (`gamekit.toml` or
+/// `.git`) after checking that directory itself, so a game without
+/// `budget.toml` keeps built-in defaults instead of inheriting a parent
+/// folder's file.
+pub fn discover_budget_file(start: &Path) -> Option<PathBuf> {
+    let abs = if start.is_absolute() {
+        start.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(start)
+    };
+    let base = if abs.is_dir() {
+        abs
+    } else {
+        abs.parent()?.to_path_buf()
+    };
+    let start_dir = fs::canonicalize(&base).unwrap_or(base);
+    let mut dir = start_dir.as_path();
+    loop {
+        let candidate = dir.join(GAME_BUDGET_FILE);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if dir.join("gamekit.toml").exists() || dir.join(".git").exists() {
+            return None;
+        }
+        match dir.parent() {
+            Some(parent) if parent != dir => dir = parent,
+            _ => return None,
+        }
+    }
+}
+
+/// Load budgets for a checked path or working directory: an explicit
+/// `--budget` path is read strictly, otherwise any ancestor `budget.toml`
+/// (up to `gamekit.toml`/`.git`) is loaded strictly, falling back to
+/// `BudgetSet::mobile()` only when no `budget.toml` exists.
+pub fn load_budget_for_path(
+    explicit: Option<&Path>,
+    context_path: &Path,
+) -> Result<BudgetSet, String> {
+    if let Some(p) = explicit {
+        return load_budget_set(p);
+    }
+    match discover_budget_file(context_path) {
+        Some(found) => load_budget_set(&found),
+        None => Ok(BudgetSet::mobile()),
+    }
 }
 
 fn img_tag(images: &[Value], ii: usize) -> String {
@@ -1217,5 +1335,42 @@ mod tests {
         assert!(parse_budget_set(r#"{"class": 5}"#).is_err());
         assert!(parse_budget_set(r#"{"class": {"hero": 5}}"#).is_err());
         assert!(parse_budget_set(r#"{"class": {"hero": {"max_bones": -1}}}"#).is_err());
+        assert!(parse_budget_set(r#"{"schema": 2}"#).is_err());
+        assert!(parse_budget_set(r#"{"schema": "1"}"#).is_err());
+    }
+
+    #[test]
+    fn schema_v1_and_duplicate_rejection() {
+        use AssetClass::*;
+        let set = parse_budget_set(
+            "\u{feff}schema = 1\n\
+             [class.monster]\n\
+             max_tris_per_mesh = 18_000\n",
+        )
+        .unwrap();
+        assert_eq!(set.for_class(Some(Monster)).max_tris_per_mesh, 18_000);
+        assert_eq!(set.for_class(Some(Monster)).max_verts_per_mesh, 12_000);
+        assert_eq!(set.for_class(Some(Hero)).max_tris_per_mesh, 25_000);
+
+        let jset = parse_budget_set(
+            r#"{"schema": 1, "class": {"monster": {"max_tris_per_mesh": 18000}}}"#,
+        )
+        .unwrap();
+        assert_eq!(jset.for_class(Some(Monster)).max_tris_per_mesh, 18_000);
+
+        // Bad schema versions, misplaced schema, duplicate keys and sections.
+        assert!(parse_budget_set("schema = 0\n").is_err());
+        assert!(parse_budget_set("schema = 2\n").is_err());
+        assert!(parse_budget_set("schema = 1\nschema = 1\n").is_err());
+        assert!(parse_budget_set("[class.monster]\nschema = 1\n").is_err());
+        assert!(parse_budget_set("max_tris_per_mesh = 10\nmax_tris_per_mesh = 20\n").is_err());
+        assert!(parse_budget_set(
+            "[class.monster]\nmax_tris_per_mesh = 18_000\nmax_tris_per_mesh = 20_000\n"
+        )
+        .is_err());
+        assert!(parse_budget_set(
+            "[class.monster]\nmax_tris_per_mesh = 18_000\n[class.monster]\nmax_bones = 64\n"
+        )
+        .is_err());
     }
 }
