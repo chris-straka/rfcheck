@@ -5,6 +5,7 @@ use crate::bevy;
 use crate::budget;
 use crate::defects;
 use crate::glb;
+use crate::mesh;
 use crate::util::{arr, join_names, plural};
 use crate::weights;
 use serde_json::{json, Value};
@@ -212,6 +213,10 @@ pub fn check_glb_full(
     }
 
     for (code, detail) in defects::check_defects(json, doc.bin) {
+        diags.push(Diag { code, detail });
+    }
+
+    for (code, detail) in mesh::check_mesh(json, doc.bin) {
         diags.push(Diag { code, detail });
     }
 

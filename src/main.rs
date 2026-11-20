@@ -10,6 +10,7 @@ mod budget;
 mod checks;
 mod defects;
 mod glb;
+mod mesh;
 mod util;
 mod weights;
 
