@@ -42,11 +42,11 @@ impl Drop for TempDir {
 
 fn pack_glb(doc: &Value, bin: &[u8]) -> Vec<u8> {
     let mut j = serde_json::to_vec(doc).expect("serialize gltf json");
-    while j.len() % 4 != 0 {
+    while !j.len().is_multiple_of(4) {
         j.push(b' ');
     }
     let mut b = bin.to_vec();
-    while b.len() % 4 != 0 {
+    while !b.len().is_multiple_of(4) {
         b.push(0);
     }
     let total = 12 + 8 + j.len() + if b.is_empty() { 0 } else { 8 + b.len() };
