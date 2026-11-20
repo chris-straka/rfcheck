@@ -516,9 +516,10 @@ pub fn check_mesh(json: &Value, bin: &[u8]) -> Vec<(&'static str, String)> {
 
 /// Sliver minimum interior angle threshold in degrees.
 const SLIVER_MIN_ANGLE_DEG: f64 = 8.0;
-/// Self-fold dihedral normal dot threshold (`dot < -0.15` => normal bend > 98.6 deg,
-/// i.e. interior dihedral angle < 81.4 deg — strictly sharper than a 90 deg cube edge).
-const SELF_FOLD_MAX_DOT: f64 = -0.15;
+/// Self-fold dihedral normal dot threshold (`dot < -0.50` => normal bend > 120 deg,
+/// i.e. interior dihedral angle < 60 deg — catches acute fold-back pinches without
+/// false-alarming on 75-90 deg cloth collars, hair valleys, or architectural corners).
+const SELF_FOLD_MAX_DOT: f64 = -0.50;
 
 #[inline]
 fn read_vec2(bin: &[u8], lay: &Layout, idx: usize) -> Option<[f64; 2]> {
@@ -1146,8 +1147,14 @@ pub fn check_mesh_hygiene(json: &Value, bin: &[u8]) -> Vec<(&'static str, String
                     // Only flag zero-UV collapse if the mesh actually uses non-zero UVs elsewhere
                     let has_real_uv = us.ratios.len() >= us.valid_tris / 4;
                     let bad_zero = has_real_uv && us.zero_uv_tris >= 5 && zero_pct >= 2.0;
+                    // Only flag chart fragmentation when paired with real UV distortion or extreme
+                    // triangle-soup shattering (avoids false alarms on clean preserved head/hair atlases).
                     let bad_shred_charts =
-                        us.valid_tris >= 500 && charts > 200 && avg_tris_per_chart < 35.0;
+                        (us.valid_tris >= 500 && charts > 300 && avg_tris_per_chart < 8.0)
+                            || (us.valid_tris >= 500
+                                && charts > 200
+                                && avg_tris_per_chart < 35.0
+                                && (spread > 8.0 || aniso_pct >= 0.5));
 
                     if bad_aniso || bad_spread || bad_zero || bad_shred_charts {
                         out.push((
@@ -1361,7 +1368,7 @@ pub fn check_mesh_hygiene(json: &Value, bin: &[u8]) -> Vec<(&'static str, String
                 "M_FOLD",
                 format!(
                     "{mtag}: {self_fold_edges} acute self-fold manifold edges ({fold_pct:.2}%, \
-                     dihedral < 81 deg)"
+                     dihedral < 60 deg)"
                 ),
             ));
         }

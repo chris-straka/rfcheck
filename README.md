@@ -93,7 +93,7 @@ contract above.
 | `M_INCONSISTENT_WINDING` | adjacent 2-face manifold edge with conflicting face winding (warn; fail with `--strict-mesh`) |
 | `M_SPECK` | disconnected mesh island under 0.5% of total surface area (warn; fail with `--strict-mesh`) |
 | `M_SLIVER` | needle/sliver triangles with minimum interior angle < 8° (warn; fail with `--strict-mesh`) |
-| `M_FOLD` | acute self-fold crease (dihedral < 81°) or > 35° normal divergence off `--reference` surface (warn; fail with `--strict-mesh`) |
+| `M_FOLD` | acute self-fold crease (dihedral < 60°) or > 35° normal divergence off `--reference` surface (warn; fail with `--strict-mesh`) |
 | `M_NECK_CRACK` | open boundary crack in the neck band (72%–87% H) of a humanoid body mesh (warn; fail with `--strict-mesh`) |
 | `M_UV_SHRED` | shredded/severely stretched UVs (anisotropic stretch > 8×, texel spread > 25×, collapsed UVs, or fragmented charts; warn; fail with `--strict-mesh`) |
 | `M_SILHOUETTE_DRIFT` | talk-camera (512 px) head/chin/jaw/ear/tip contour drift > 1.5 px against `--reference` (warn; fail with `--strict-mesh`) |
