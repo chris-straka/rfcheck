@@ -324,22 +324,39 @@ fn is_sparse(json: &Value, ai: usize) -> bool {
         .is_some()
 }
 
+fn is_intentional_inward_shell(mesh_name: &str) -> bool {
+    let lower = mesh_name.to_ascii_lowercase();
+    lower.contains("skybox")
+        || lower.contains("skydome")
+        || lower.contains("outline")
+        || lower.contains("inverted_hull")
+}
+
 /// Flag triangle primitives with inverted normals or inside-out closed shells.
 ///
 /// 1. Normal-vs-winding disagreement (when `NORMAL` is present): fires when
-///    either >= 0.2% (and >= 1) of valid triangles have all 3 vertex normals
-///    strictly opposing the geometric face normal (`dot < -0.1`), or >= 2%
-///    (and >= 10) have opposing average normal alongside >= 5 strictly inverted
-///    triangles.
-/// 2. Inside-out closed shell (unless the mesh is instantiated via a mirrored
-///    negative-determinant node): fires when any watertight connected component
-///    (>= 4 triangles) has strictly negative signed volume.
+///    either >= 0.2% (and >= 2, or 100% on tiny 1-tri meshes) of valid
+///    triangles have all 3 vertex normals strictly opposing the geometric face
+///    normal (`dot < -0.1`), or >= 2% (and >= 10) have opposing average normal
+///    alongside >= 5 strictly inverted triangles.
+/// 2. Inside-out closed shell across all primitives of a mesh (unless the mesh
+///    is instantiated via a mirrored negative-determinant node or explicitly
+///    named as an inward shell such as `skybox`/`skydome`/`outline`/`inverted_hull`):
+///    fires when any watertight connected component (>= 4 triangles) has
+///    strictly negative signed volume.
 pub fn check_mesh(json: &Value, bin: &[u8]) -> Vec<(&'static str, String)> {
     let mut out: Vec<(&'static str, String)> = Vec::new();
     let meshes = arr(json, "meshes");
     for (mi, mesh) in meshes.iter().enumerate() {
         let mtag = mesh_tag(meshes, mi);
         let mirrored = mesh_has_mirrored_node(json, mi);
+        let skip_inward = mirrored || is_intentional_inward_shell(&mtag);
+        let mut mesh_shells = if skip_inward {
+            None
+        } else {
+            Some(ShellBuilder::default())
+        };
+        let mut mesh_total_tris = 0usize;
         for (pi, prim) in arr(mesh, "primitives").iter().enumerate() {
             let mode = prim.get("mode").and_then(Value::as_u64).unwrap_or(4);
             if mode != 4 && mode != 5 {
@@ -412,11 +429,6 @@ pub fn check_mesh(json: &Value, bin: &[u8]) -> Vec<(&'static str, String)> {
             };
 
             let mut counts = NormalCounts::default();
-            let mut shells = if mirrored {
-                None
-            } else {
-                Some(ShellBuilder::default())
-            };
 
             if mode == 4 {
                 let mut k = 0usize;
@@ -431,7 +443,7 @@ pub fn check_mesh(json: &Value, bin: &[u8]) -> Vec<(&'static str, String)> {
                                 nrm.as_ref(),
                                 [a, b, c],
                                 &mut counts,
-                                &mut shells,
+                                &mut mesh_shells,
                             );
                         }
                     }
@@ -451,7 +463,7 @@ pub fn check_mesh(json: &Value, bin: &[u8]) -> Vec<(&'static str, String)> {
                                 nrm.as_ref(),
                                 tri,
                                 &mut counts,
-                                &mut shells,
+                                &mut mesh_shells,
                             );
                         }
                     }
@@ -461,13 +473,14 @@ pub fn check_mesh(json: &Value, bin: &[u8]) -> Vec<(&'static str, String)> {
             if counts.total == 0 {
                 continue;
             }
+            mesh_total_tris += counts.total;
             let NormalCounts {
                 total,
                 flipped_avg,
                 flipped_all,
             } = counts;
-            let bad_all =
-                flipped_all >= 1 && flipped_all.saturating_mul(1000) >= total.saturating_mul(2);
+            let bad_all = (flipped_all >= 2 || (total == 1 && flipped_all == 1))
+                && flipped_all.saturating_mul(1000) >= total.saturating_mul(2);
             let bad_avg = flipped_avg >= 10
                 && flipped_avg.saturating_mul(100) >= total.saturating_mul(2)
                 && flipped_all >= 5;
@@ -482,19 +495,19 @@ pub fn check_mesh(json: &Value, bin: &[u8]) -> Vec<(&'static str, String)> {
                     ),
                 ));
             }
+        }
 
-            if let Some(mut sb) = shells {
-                let (neg_shells, neg_tris) = sb.inside_out_closed_shells();
-                if neg_shells > 0 {
-                    out.push((
-                        "M_FLIPPED_NORMAL",
-                        format!(
-                            "{mtag} prim {pi}: {neg_shells} closed shell{} ({neg_tris} of {total} \
-                             triangles) inside-out (negative signed volume)",
-                            if neg_shells == 1 { "" } else { "s" },
-                        ),
-                    ));
-                }
+        if let Some(mut sb) = mesh_shells {
+            let (neg_shells, neg_tris) = sb.inside_out_closed_shells();
+            if neg_shells > 0 {
+                out.push((
+                    "M_FLIPPED_NORMAL",
+                    format!(
+                        "{mtag}: {neg_shells} closed shell{} ({neg_tris} of {mesh_total_tris} \
+                         triangles) inside-out (negative signed volume)",
+                        if neg_shells == 1 { "" } else { "s" },
+                    ),
+                ));
             }
         }
     }
@@ -797,5 +810,142 @@ mod tests {
             Some([-1.0, 1.0, 1.0]),
         );
         assert!(!codes(&mirrored_glb).contains(&"M_FLIPPED_NORMAL"));
+    }
+
+    #[test]
+    fn small_prop_requires_at_least_two_strictly_inverted_triangles() {
+        let make = |n_flipped: usize| {
+            let mut pos = Vec::new();
+            let mut nrm = Vec::new();
+            for i in 0..400 {
+                let x = i as f32;
+                pos.extend_from_slice(&[[x, 0.0, 0.0], [x + 1.0, 0.0, 0.0], [x, 1.0, 0.0]]);
+                let nz = if i < n_flipped { -1.0 } else { 1.0 };
+                nrm.extend_from_slice(&[[0.0, 0.0, nz]; 3]);
+            }
+            build_mesh_glb(&pos, &nrm, None, Some(4), false, None)
+        };
+        // 1/400 = 0.25% >= 0.2%, but < 2 inverted triangles -> avoids single thin-card false alarm.
+        assert!(!codes(&make(1)).contains(&"M_FLIPPED_NORMAL"));
+        // 2/400 = 0.5% and >= 2 inverted triangles -> flags cleanly.
+        assert!(codes(&make(2)).contains(&"M_FLIPPED_NORMAL"));
+    }
+
+    #[test]
+    fn multi_primitive_inside_out_closed_shell_flags() {
+        // Split a single inside-out cube across two material primitives (3 faces each):
+        // each primitive alone is an open half-box, but together they form a closed shell.
+        let (pos, nrm, idx) = unit_cube(true);
+        let mut bin = Vec::new();
+        for p in &pos {
+            for &x in p {
+                bin.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        let pos_len = bin.len();
+        let nrm_off = bin.len();
+        for n in &nrm {
+            for &x in n {
+                bin.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        let nrm_len = bin.len() - nrm_off;
+        let split = idx.len() / 2;
+        let idx0_off = bin.len();
+        for &i in &idx[..split] {
+            bin.extend_from_slice(&i.to_le_bytes());
+        }
+        let idx0_len = bin.len() - idx0_off;
+        let idx1_off = bin.len();
+        for &i in &idx[split..] {
+            bin.extend_from_slice(&i.to_le_bytes());
+        }
+        let idx1_len = bin.len() - idx1_off;
+        let doc = json!({
+            "asset": {"version": "2.0"},
+            "scenes": [{"nodes": [0]}],
+            "nodes": [{"name": "SplitProp", "mesh": 0}],
+            "materials": [{"name": "MatA"}, {"name": "MatB"}],
+            "meshes": [{
+                "name": "MultiMatProp",
+                "primitives": [
+                    {"attributes": {"POSITION": 0, "NORMAL": 1}, "indices": 2, "material": 0},
+                    {"attributes": {"POSITION": 0, "NORMAL": 1}, "indices": 3, "material": 1},
+                ]
+            }],
+            "buffers": [{"byteLength": bin.len()}],
+            "bufferViews": [
+                {"buffer": 0, "byteOffset": 0, "byteLength": pos_len},
+                {"buffer": 0, "byteOffset": nrm_off, "byteLength": nrm_len},
+                {"buffer": 0, "byteOffset": idx0_off, "byteLength": idx0_len},
+                {"buffer": 0, "byteOffset": idx1_off, "byteLength": idx1_len},
+            ],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "count": pos.len(), "type": "VEC3"},
+                {"bufferView": 1, "componentType": 5126, "count": nrm.len(), "type": "VEC3"},
+                {"bufferView": 2, "componentType": 5123, "count": split, "type": "SCALAR"},
+                {"bufferView": 3, "componentType": 5123, "count": idx.len() - split, "type": "SCALAR"},
+            ],
+        });
+        let glb = pack_bin(&doc, &bin);
+        let r = checks::check_glb_with_class(&glb, None, Some(AssetClass::Prop));
+        let d = r
+            .diags
+            .iter()
+            .find(|d| d.code == "M_FLIPPED_NORMAL")
+            .expect("multi-material inside-out prop must flag M_FLIPPED_NORMAL");
+        assert!(d.detail.contains("12 of 12 triangles"), "{}", d.detail);
+    }
+
+    #[test]
+    fn intentional_skybox_and_outline_inward_shells_skip_signed_volume() {
+        let (pos, nrm, idx) = unit_cube(true);
+        for mesh_name in ["World_Skybox", "Character_Outline", "Body_Inverted_Hull"] {
+            let mut bin = Vec::new();
+            for p in &pos {
+                for &x in p {
+                    bin.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            let pos_len = bin.len();
+            let nrm_off = bin.len();
+            for n in &nrm {
+                for &x in n {
+                    bin.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            let nrm_len = bin.len() - nrm_off;
+            let idx_off = bin.len();
+            for &i in &idx {
+                bin.extend_from_slice(&i.to_le_bytes());
+            }
+            let idx_len = bin.len() - idx_off;
+            let doc = json!({
+                "asset": {"version": "2.0"},
+                "scenes": [{"nodes": [0]}],
+                "nodes": [{"name": mesh_name, "mesh": 0}],
+                "materials": [{"name": "Mat"}],
+                "meshes": [{
+                    "name": mesh_name,
+                    "primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1}, "indices": 2, "material": 0}]
+                }],
+                "buffers": [{"byteLength": bin.len()}],
+                "bufferViews": [
+                    {"buffer": 0, "byteOffset": 0, "byteLength": pos_len},
+                    {"buffer": 0, "byteOffset": nrm_off, "byteLength": nrm_len},
+                    {"buffer": 0, "byteOffset": idx_off, "byteLength": idx_len},
+                ],
+                "accessors": [
+                    {"bufferView": 0, "componentType": 5126, "count": pos.len(), "type": "VEC3"},
+                    {"bufferView": 1, "componentType": 5126, "count": nrm.len(), "type": "VEC3"},
+                    {"bufferView": 2, "componentType": 5123, "count": idx.len(), "type": "SCALAR"},
+                ],
+            });
+            let glb = pack_bin(&doc, &bin);
+            assert!(
+                !codes(&glb).contains(&"M_FLIPPED_NORMAL"),
+                "{mesh_name} should skip inward shell check"
+            );
+        }
     }
 }

@@ -224,34 +224,51 @@ def f_flipped_normal(j, b):
 
 
 def f_inside_out_shell(j, b):
-    """Flip BOTH triangle winding and exported normals across the largest
-    indexed triangle primitive so normal-vs-winding agrees 100% and only the
-    closed-shell signed-volume check catches the inside-out mesh."""
+    """Flip BOTH triangle winding and exported normals across every indexed
+    triangle primitive of the largest mesh so normal-vs-winding agrees 100% and
+    only the closed-shell signed-volume check catches the inside-out mesh."""
     cands = [
-        p for m in j.get("meshes", []) for p in m.get("primitives", [])
-        if p.get("mode", 4) == 4 and "indices" in p and "POSITION" in p.get("attributes", {})
+        m for m in j.get("meshes", [])
+        if any(
+            p.get("mode", 4) == 4 and "indices" in p and "POSITION" in p.get("attributes", {})
+            for p in m.get("primitives", [])
+        )
     ]
     if not cands:
         return False
-    p = max(cands, key=lambda pr: j["accessors"][pr["attributes"]["POSITION"]]["count"])
-    acc = p["indices"]
-    n_tris = j["accessors"][acc]["count"] // 3
-    if n_tris < 4:
-        return False
-    for t in range(n_tris):
-        off1, f1 = elem(j, acc, 3 * t + 1, 0)
-        off2, f2 = elem(j, acc, 3 * t + 2, 0)
-        v1 = struct.unpack_from("<" + f1, b, off1)[0]
-        v2 = struct.unpack_from("<" + f2, b, off2)[0]
-        struct.pack_into("<" + f1, b, off1, v2)
-        struct.pack_into("<" + f2, b, off2, v1)
-    nrm_acc = p["attributes"].get("NORMAL")
-    if nrm_acc is not None and j["accessors"][nrm_acc]["componentType"] == 5126:
-        for i in range(j["accessors"][nrm_acc]["count"]):
-            for k in range(3):
-                off, _ = elem(j, nrm_acc, i, k)
-                struct.pack_into("<f", b, off, -struct.unpack_from("<f", b, off)[0])
-    return True
+    mesh = max(
+        cands,
+        key=lambda m: sum(
+            j["accessors"][p["attributes"]["POSITION"]]["count"]
+            for p in m.get("primitives", [])
+            if p.get("mode", 4) == 4 and "indices" in p and "POSITION" in p.get("attributes", {})
+        ),
+    )
+    flipped_tris = 0
+    seen_nrms = set()
+    for p in mesh.get("primitives", []):
+        if p.get("mode", 4) != 4 or "indices" not in p or "POSITION" not in p.get("attributes", {}):
+            continue
+        acc = p["indices"]
+        n_tris = j["accessors"][acc]["count"] // 3
+        if n_tris < 1:
+            continue
+        for t in range(n_tris):
+            off1, f1 = elem(j, acc, 3 * t + 1, 0)
+            off2, f2 = elem(j, acc, 3 * t + 2, 0)
+            v1 = struct.unpack_from("<" + f1, b, off1)[0]
+            v2 = struct.unpack_from("<" + f2, b, off2)[0]
+            struct.pack_into("<" + f1, b, off1, v2)
+            struct.pack_into("<" + f2, b, off2, v1)
+        flipped_tris += n_tris
+        nrm_acc = p["attributes"].get("NORMAL")
+        if nrm_acc is not None and nrm_acc not in seen_nrms and j["accessors"][nrm_acc]["componentType"] == 5126:
+            seen_nrms.add(nrm_acc)
+            for i in range(j["accessors"][nrm_acc]["count"]):
+                for k in range(3):
+                    off, _ = elem(j, nrm_acc, i, k)
+                    struct.pack_into("<f", b, off, -struct.unpack_from("<f", b, off)[0])
+    return flipped_tris >= 4
 
 
 FAULTS = [("W_UNNORMALIZED", f_unnormalized), ("X_JOINT_RANGE", f_joint_range), ("W_OVER_INFLUENCE", f_over_influence),
