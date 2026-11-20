@@ -11,6 +11,7 @@ mod checks;
 mod defects;
 mod glb;
 mod mesh;
+mod reference;
 mod util;
 mod weights;
 
@@ -22,7 +23,8 @@ use std::process::ExitCode;
 fn print_help() {
     println!(
         "usage: rfcheck [--json] [--mobile] [--budget file] [--class name]\n\
-         \x20             [--image-codecs list] [--] file.glb ...\n\
+         \x20             [--image-codecs list] [--reference ref.glb] [--strict-mesh]\n\
+         \x20             [--] file.glb ...\n\
          \x20      rfcheck --print-budget [--class name] [--budget file]\n\
          \n\
          Check each GLB against the rigforge export contract and print\n\
@@ -35,6 +37,9 @@ fn print_help() {
          files may be unrigged. Implies budget checks, like --budget.\n\
          --image-codecs list sets the texture codecs the game's Bevy build\n\
          decodes (default png,hdr,ktx2; also jpeg, webp, dds).\n\
+         --reference ref.glb compares surface folds (>35 deg) and talk-cam\n\
+         silhouette drift (>1.5 px) against a high-poly source GLB.\n\
+         --strict-mesh treats M_* mesh-hygiene/conversion findings as failures.\n\
          --print-budget prints one class's budget as JSON and exits: the\n\
          one place tools read a class's triangle budget from."
     );
@@ -44,7 +49,9 @@ fn main() -> ExitCode {
     let raw: Vec<String> = env::args().skip(1).collect();
     let mut json_out = false;
     let mut want_budget = false;
+    let mut strict_mesh = false;
     let mut budget_path: Option<&str> = None;
+    let mut ref_path: Option<&str> = None;
     let mut class: Option<budget::AssetClass> = None;
     let mut codecs: Vec<&'static str> = bevy::DEFAULT_CODECS.to_vec();
     let mut files: Vec<&str> = Vec::new();
@@ -61,8 +68,19 @@ fn main() -> ExitCode {
             json_out = true;
         } else if a == "--mobile" {
             want_budget = true;
+        } else if a == "--strict-mesh" {
+            strict_mesh = true;
         } else if a == "--print-budget" {
             print_budget = true;
+        } else if a == "--reference" {
+            i += 1;
+            match raw.get(i) {
+                Some(p) => ref_path = Some(p),
+                None => {
+                    eprintln!("rfcheck: --reference needs a file argument (see --help)");
+                    return ExitCode::from(2);
+                }
+            }
         } else if a == "--budget" {
             i += 1;
             match raw.get(i) {
@@ -159,7 +177,22 @@ fn main() -> ExitCode {
         None => None,
     };
 
-    let opts = bevy::BevyOpts { codecs: &codecs };
+    let ref_bytes: Option<Vec<u8>> = match ref_path {
+        Some(p) => match fs::read(Path::new(p)) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("rfcheck: cannot read --reference '{p}': {e}");
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
+
+    let opts = checks::CheckOpts {
+        bevy: bevy::BevyOpts { codecs: &codecs },
+        strict_mesh,
+        reference: ref_bytes.as_deref(),
+    };
     let mut failed = false;
     for f in &files {
         let path = Path::new(f);
@@ -167,7 +200,7 @@ fn main() -> ExitCode {
             Err(e) => checks::Report::unreadable(format!("cannot read file: {e}"), class),
             Ok(bytes) => {
                 let b = budgets.as_ref().map(|s| s.for_class(class));
-                checks::check_glb_full(&bytes, b, class, &opts)
+                checks::check_glb_with_opts(&bytes, b, class, &opts)
             }
         };
         if json_out {

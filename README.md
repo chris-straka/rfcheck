@@ -16,6 +16,7 @@ cargo build --release
 ./target/release/rfcheck --class weapon sword.glb # weapons may be unrigged
 ./target/release/rfcheck --class level arena.glb  # levels: LOD markers, no rig
 ./target/release/rfcheck --image-codecs png,ktx2,jpeg ai.glb # game enables jpeg
+./target/release/rfcheck --reference raw.glb --strict-mesh hero.glb # compare vs source
 ```
 
 Output is one `CODE path: detail` line per finding, `OK path: summary`
@@ -86,6 +87,16 @@ contract above.
 | `X_EMPTY_PRIM` | primitive with zero vertices and zero indices |
 | `X_MORPH_COUNT` | morph weights/targets/counts disagree |
 | `M_FLIPPED_NORMAL` | mesh primitive has inverted-normal triangles (vertex normals oppose geometric face normal) or an inside-out closed shell (negative signed volume) |
+| `M_OPEN_EDGE` | open boundary edges on a mostly-closed body/prop mesh (warn; fail with `--strict-mesh`) |
+| `M_NON_MANIFOLD` | welded edge shared by > 2 faces (warn; fail with `--strict-mesh`) |
+| `M_DEGENERATE_TRI` | zero-area or duplicate-vertex triangle (warn; fail with `--strict-mesh`) |
+| `M_INCONSISTENT_WINDING` | adjacent 2-face manifold edge with conflicting face winding (warn; fail with `--strict-mesh`) |
+| `M_SPECK` | disconnected mesh island under 0.5% of total surface area (warn; fail with `--strict-mesh`) |
+| `M_SLIVER` | needle/sliver triangles with minimum interior angle < 8° (warn; fail with `--strict-mesh`) |
+| `M_FOLD` | acute self-fold crease (dihedral < 81°) or > 35° normal divergence off `--reference` surface (warn; fail with `--strict-mesh`) |
+| `M_NECK_CRACK` | open boundary crack in the neck band (72%–87% H) of a humanoid body mesh (warn; fail with `--strict-mesh`) |
+| `M_UV_SHRED` | shredded/severely stretched UVs (anisotropic stretch > 8×, texel spread > 25×, collapsed UVs, or fragmented charts; warn; fail with `--strict-mesh`) |
+| `M_SILHOUETTE_DRIFT` | talk-camera (512 px) head/chin/jaw/ear/tip contour drift > 1.5 px against `--reference` (warn; fail with `--strict-mesh`) |
 | `B_EXT_REQUIRED` | `extensionsRequired` names an extension Bevy cannot load (Draco, meshopt, quantization, basisu, ...) |
 | `B_PRIM_MODE` | primitive mode LINE_LOOP or TRIANGLE_FAN (Bevy rejects) |
 | `B_NODE_CYCLE` | node hierarchy has a cycle (Bevy needs a tree) |

@@ -15,7 +15,7 @@ use crate::util::{arr, as_idx, mesh_tag};
 use crate::weights;
 use glbkit::accessor::{Component, Layout};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Minimum cross-product magnitude for a triangle to be considered non-degenerate.
 const MIN_AREA2: f64 = 1e-12;
@@ -514,6 +514,861 @@ pub fn check_mesh(json: &Value, bin: &[u8]) -> Vec<(&'static str, String)> {
     out
 }
 
+/// Sliver minimum interior angle threshold in degrees.
+const SLIVER_MIN_ANGLE_DEG: f64 = 8.0;
+/// Self-fold dihedral normal dot threshold (`dot < -0.15` => normal bend > 98.6 deg,
+/// i.e. interior dihedral angle < 81.4 deg — strictly sharper than a 90 deg cube edge).
+const SELF_FOLD_MAX_DOT: f64 = -0.15;
+
+#[inline]
+fn read_vec2(bin: &[u8], lay: &Layout, idx: usize) -> Option<[f64; 2]> {
+    let u = f64::from(weights::f32_at(bin, lay, idx, 0)?);
+    let v = f64::from(weights::f32_at(bin, lay, idx, 1)?);
+    if u.is_finite() && v.is_finite() {
+        Some([u, v])
+    } else {
+        None
+    }
+}
+
+fn is_intentional_open_sheet(mesh_name: &str) -> bool {
+    let lower = mesh_name.to_ascii_lowercase();
+    [
+        "hair",
+        "cape",
+        "cloak",
+        "leaf",
+        "leaves",
+        "foliage",
+        "grass",
+        "plane",
+        "ground",
+        "terrain",
+        "skybox",
+        "skydome",
+        "card",
+        "ribbon",
+        "cloth",
+        "curtain",
+        "water",
+        "billboard",
+        "eyelash",
+        "lash",
+        "brow",
+        "outline",
+        "inverted_hull",
+    ]
+    .iter()
+    .any(|w| lower.contains(w))
+}
+
+fn min_tri_angle_deg(pa: [f64; 3], pb: [f64; 3], pc: [f64; 3]) -> f64 {
+    let e0 = sub(pb, pa);
+    let e1 = sub(pc, pb);
+    let e2 = sub(pa, pc);
+    let l0 = len(e0);
+    let l1 = len(e1);
+    let l2 = len(e2);
+    if l0 <= 1e-12 || l1 <= 1e-12 || l2 <= 1e-12 {
+        return 0.0;
+    }
+    let c0 = (-dot(e0, e2) / (l0 * l2)).clamp(-1.0, 1.0);
+    let c1 = (-dot(e0, e1) / (l0 * l1)).clamp(-1.0, 1.0);
+    let c2 = (-dot(e1, e2) / (l1 * l2)).clamp(-1.0, 1.0);
+    // Larger cosine = smaller angle
+    c0.max(c1).max(c2).acos().to_degrees()
+}
+
+struct HygieneEdge {
+    count: usize,
+    bal: i32,
+    normals: [[f64; 3]; 2],
+    mid_y: f64,
+}
+
+struct HygieneBuilder {
+    welded: BTreeMap<[i64; 3], usize>,
+    parent: Vec<usize>,
+    edges: BTreeMap<(usize, usize), HygieneEdge>,
+    tri_comp_root: Vec<usize>,
+    tri_area: Vec<f64>,
+    valid_tris: usize,
+    degenerate_tris: usize,
+    sliver_tris: usize,
+    neck_sliver_tris: usize,
+    worst_sliver_deg: f64,
+    min_y: f64,
+    max_y: f64,
+    min_x: f64,
+    max_x: f64,
+    min_z: f64,
+    max_z: f64,
+    tri_centers_y: Vec<f64>,
+    tri_is_sliver: Vec<bool>,
+}
+
+impl Default for HygieneBuilder {
+    fn default() -> Self {
+        Self {
+            welded: BTreeMap::new(),
+            parent: Vec::new(),
+            edges: BTreeMap::new(),
+            tri_comp_root: Vec::new(),
+            tri_area: Vec::new(),
+            valid_tris: 0,
+            degenerate_tris: 0,
+            sliver_tris: 0,
+            neck_sliver_tris: 0,
+            worst_sliver_deg: 180.0,
+            min_y: f64::INFINITY,
+            max_y: f64::NEG_INFINITY,
+            min_x: f64::INFINITY,
+            max_x: f64::NEG_INFINITY,
+            min_z: f64::INFINITY,
+            max_z: f64::NEG_INFINITY,
+            tri_centers_y: Vec::new(),
+            tri_is_sliver: Vec::new(),
+        }
+    }
+}
+
+impl HygieneBuilder {
+    fn weld(&mut self, p: [f64; 3]) -> usize {
+        self.min_x = self.min_x.min(p[0]);
+        self.max_x = self.max_x.max(p[0]);
+        self.min_y = self.min_y.min(p[1]);
+        self.max_y = self.max_y.max(p[1]);
+        self.min_z = self.min_z.min(p[2]);
+        self.max_z = self.max_z.max(p[2]);
+        let key = [
+            (p[0] * WELD_SCALE).round() as i64,
+            (p[1] * WELD_SCALE).round() as i64,
+            (p[2] * WELD_SCALE).round() as i64,
+        ];
+        if let Some(&id) = self.welded.get(&key) {
+            return id;
+        }
+        let id = self.parent.len();
+        self.parent.push(id);
+        self.welded.insert(key, id);
+        id
+    }
+
+    fn find(&mut self, mut x: usize) -> usize {
+        while self.parent[x] != x {
+            self.parent[x] = self.parent[self.parent[x]];
+            x = self.parent[x];
+        }
+        x
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra != rb {
+            self.parent[ra] = rb;
+        }
+    }
+
+    fn push_tri(&mut self, pa: [f64; 3], pb: [f64; 3], pc: [f64; 3]) {
+        let wa = self.weld(pa);
+        let wb = self.weld(pb);
+        let wc = self.weld(pc);
+        if wa == wb || wb == wc || wc == wa {
+            self.degenerate_tris += 1;
+            return;
+        }
+        let face = cross(sub(pb, pa), sub(pc, pa));
+        let fl = len(face);
+        if !fl.is_finite() || fl <= MIN_AREA2 {
+            self.degenerate_tris += 1;
+            return;
+        }
+        self.valid_tris += 1;
+        let area = 0.5 * fl;
+        let fnrm = [face[0] / fl, face[1] / fl, face[2] / fl];
+
+        let min_ang = min_tri_angle_deg(pa, pb, pc);
+        let is_sliver = min_ang < SLIVER_MIN_ANGLE_DEG;
+        if is_sliver {
+            self.sliver_tris += 1;
+            if min_ang < self.worst_sliver_deg {
+                self.worst_sliver_deg = min_ang;
+            }
+        }
+        self.tri_centers_y.push((pa[1] + pb[1] + pc[1]) / 3.0);
+        self.tri_is_sliver.push(is_sliver);
+
+        self.union(wa, wb);
+        self.union(wb, wc);
+        self.tri_comp_root.push(wa);
+        self.tri_area.push(area);
+
+        let verts = [(wa, pa), (wb, pb), (wc, pc)];
+        for (i, j) in [(0, 1), (1, 2), (2, 0)] {
+            let (u, pu) = verts[i];
+            let (v, pv) = verts[j];
+            let (ek, dir) = if u < v {
+                ((u, v), 1i32)
+            } else {
+                ((v, u), -1i32)
+            };
+            let mid_y = 0.5 * (pu[1] + pv[1]);
+            let entry = self.edges.entry(ek).or_insert(HygieneEdge {
+                count: 0,
+                bal: 0,
+                normals: [[0.0; 3]; 2],
+                mid_y,
+            });
+            if entry.count < 2 {
+                entry.normals[entry.count] = fnrm;
+            }
+            entry.count += 1;
+            entry.bal += dir;
+        }
+    }
+}
+
+struct UvPrimStats {
+    valid_tris: usize,
+    zero_uv_tris: usize,
+    aniso_gt8: usize,
+    max_aniso: f64,
+    ratios: Vec<f64>,
+    uv_nodes: BTreeMap<([i64; 3], i64, i64), usize>,
+    uv_parent: Vec<usize>,
+    tri_uv_rep: Vec<usize>,
+}
+
+impl Default for UvPrimStats {
+    fn default() -> Self {
+        Self {
+            valid_tris: 0,
+            zero_uv_tris: 0,
+            aniso_gt8: 0,
+            max_aniso: 1.0,
+            ratios: Vec::new(),
+            uv_nodes: BTreeMap::new(),
+            uv_parent: Vec::new(),
+            tri_uv_rep: Vec::new(),
+        }
+    }
+}
+
+impl UvPrimStats {
+    fn node(&mut self, p: [f64; 3], uv: [f64; 2]) -> usize {
+        let pk = [
+            (p[0] * WELD_SCALE).round() as i64,
+            (p[1] * WELD_SCALE).round() as i64,
+            (p[2] * WELD_SCALE).round() as i64,
+        ];
+        let uk = (uv[0].clamp(-8.0, 8.0) * 65536.0).round() as i64;
+        let vk = (uv[1].clamp(-8.0, 8.0) * 65536.0).round() as i64;
+        let key = (pk, uk, vk);
+        if let Some(&id) = self.uv_nodes.get(&key) {
+            return id;
+        }
+        let id = self.uv_parent.len();
+        self.uv_parent.push(id);
+        self.uv_nodes.insert(key, id);
+        id
+    }
+
+    fn find(&mut self, mut x: usize) -> usize {
+        while self.uv_parent[x] != x {
+            self.uv_parent[x] = self.uv_parent[self.uv_parent[x]];
+            x = self.uv_parent[x];
+        }
+        x
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra != rb {
+            self.uv_parent[ra] = rb;
+        }
+    }
+
+    fn push_tri(
+        &mut self,
+        pa: [f64; 3],
+        pb: [f64; 3],
+        pc: [f64; 3],
+        ua: [f64; 2],
+        ub: [f64; 2],
+        uc: [f64; 2],
+    ) {
+        let area3 = 0.5 * len(cross(sub(pb, pa), sub(pc, pa)));
+        if !area3.is_finite() || area3 <= 0.5 * MIN_AREA2 {
+            return;
+        }
+        self.valid_tris += 1;
+
+        let na = self.node(pa, ua);
+        let nb = self.node(pb, ub);
+        let nc = self.node(pc, uc);
+        self.union(na, nb);
+        self.union(nb, nc);
+        self.tri_uv_rep.push(na);
+
+        let d1 = [ub[0] - ua[0], ub[1] - ua[1]];
+        let d2 = [uc[0] - ua[0], uc[1] - ua[1]];
+        let uarea = 0.5 * (d1[0] * d2[1] - d1[1] * d2[0]).abs();
+        if uarea <= 1e-10 {
+            self.zero_uv_tris += 1;
+            return;
+        }
+        self.ratios.push(uarea / area3);
+
+        let l0 = len(sub(pb, pa));
+        let l1 = len(sub(pc, pb));
+        let l2 = len(sub(pa, pc));
+        let u0 = ((ub[0] - ua[0]).hypot(ub[1] - ua[1])).max(1e-12);
+        let u1 = ((uc[0] - ub[0]).hypot(uc[1] - ub[1])).max(1e-12);
+        let u2 = ((ua[0] - uc[0]).hypot(ua[1] - uc[1])).max(1e-12);
+        if l0 > 1e-9 && l1 > 1e-9 && l2 > 1e-9 {
+            let r0 = u0 / l0;
+            let r1 = u1 / l1;
+            let r2 = u2 / l2;
+            let rmax = r0.max(r1).max(r2);
+            let rmin = r0.min(r1).min(r2).max(1e-9);
+            let aniso = rmax / rmin;
+            if aniso > self.max_aniso {
+                self.max_aniso = aniso;
+            }
+            if aniso > 8.0 {
+                self.aniso_gt8 += 1;
+            }
+        }
+    }
+
+    fn chart_count(&mut self) -> usize {
+        let mut roots: BTreeMap<usize, usize> = BTreeMap::new();
+        for i in 0..self.tri_uv_rep.len() {
+            let rep = self.tri_uv_rep[i];
+            let r = self.find(rep);
+            *roots.entry(r).or_insert(0) += 1;
+        }
+        roots.len()
+    }
+}
+
+/// Warn-level mesh-hygiene and character-conversion checks (`M_*`):
+/// - `M_DEGENERATE_TRI`: duplicate-vertex or zero-area triangles
+/// - `M_NON_MANIFOLD`: welded edges shared by > 2 faces
+/// - `M_INCONSISTENT_WINDING`: adjacent 2-face manifold edges with conflicting half-edge winding
+/// - `M_OPEN_EDGE`: open boundary edges on a mostly-closed body/prop mesh
+/// - `M_NECK_CRACK`: open boundary crack in the neck band (72%..87% H) of a humanoid body mesh
+/// - `M_SPECK`: tiny disconnected islands (< 0.5% of mesh surface area)
+/// - `M_SLIVER`: needle triangles with minimum interior angle < 8 deg
+/// - `M_FOLD`: acute self-fold creases (adjacent manifold faces folded > 98.6 deg / dihedral < 81.4 deg)
+/// - `M_UV_SHRED`: severely stretched, collapsed, or hyper-fragmented UVs
+pub fn check_mesh_hygiene(json: &Value, bin: &[u8]) -> Vec<(&'static str, String)> {
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    let meshes = arr(json, "meshes");
+    let nodes = arr(json, "nodes");
+
+    // Pre-collect welded boundary edges across all meshes so clean node-split seams
+    // (e.g. *_BodyFace meeting *_Hair along coincident vertices) are not misreported
+    // as open holes or neck cracks.
+    let mut global_edge_counts: BTreeMap<([i64; 3], [i64; 3]), usize> = BTreeMap::new();
+    let quant = |p: [f64; 3]| -> [i64; 3] {
+        [
+            (p[0] * WELD_SCALE).round() as i64,
+            (p[1] * WELD_SCALE).round() as i64,
+            (p[2] * WELD_SCALE).round() as i64,
+        ]
+    };
+    if meshes.len() > 1 {
+        for mesh in meshes {
+            for prim in arr(mesh, "primitives") {
+                let mode = prim.get("mode").and_then(Value::as_u64).unwrap_or(4);
+                if mode != 4 && mode != 5 {
+                    continue;
+                }
+                let Some(pos_i) = prim
+                    .get("attributes")
+                    .and_then(|a| a.get("POSITION"))
+                    .and_then(as_idx)
+                else {
+                    continue;
+                };
+                if is_sparse(json, pos_i) {
+                    continue;
+                }
+                let Ok(pos) = weights::layout_of(json, bin.len(), pos_i, "POSITION") else {
+                    continue;
+                };
+                if pos.component != Component::F32 || pos.width != 3 || pos.count < 3 {
+                    continue;
+                }
+                let idx_lay: Option<Layout> = match prim.get("indices").and_then(as_idx) {
+                    None => None,
+                    Some(ii) if !is_sparse(json, ii) => {
+                        weights::layout_of(json, bin.len(), ii, "indices")
+                            .ok()
+                            .filter(|l| {
+                                l.width == 1
+                                    && matches!(
+                                        l.component,
+                                        Component::U8 | Component::U16 | Component::U32
+                                    )
+                            })
+                    }
+                    _ => continue,
+                };
+                let n_idx = idx_lay.map_or(pos.count, |l| l.count);
+                let read_idx = |k: usize| -> Option<usize> {
+                    match &idx_lay {
+                        Some(lay) => usize::try_from(lay.read_uint(bin, k, 0)?).ok(),
+                        None => Some(k),
+                    }
+                };
+                let mut add_tri = |a: usize, b: usize, c: usize| {
+                    let (Some(pa), Some(pb), Some(pc)) = (
+                        read_vec3(bin, &pos, a),
+                        read_vec3(bin, &pos, b),
+                        read_vec3(bin, &pos, c),
+                    ) else {
+                        return;
+                    };
+                    let (ka, kb, kc) = (quant(pa), quant(pb), quant(pc));
+                    if ka == kb || kb == kc || kc == ka {
+                        return;
+                    }
+                    for (u, v) in [(ka, kb), (kb, kc), (kc, ka)] {
+                        let ek = if u < v { (u, v) } else { (v, u) };
+                        *global_edge_counts.entry(ek).or_insert(0) += 1;
+                    }
+                };
+                if mode == 4 {
+                    let mut k = 0usize;
+                    while k + 2 < n_idx {
+                        if let (Some(a), Some(b), Some(c)) =
+                            (read_idx(k), read_idx(k + 1), read_idx(k + 2))
+                        {
+                            if a < pos.count && b < pos.count && c < pos.count {
+                                add_tri(a, b, c);
+                            }
+                        }
+                        k += 3;
+                    }
+                } else {
+                    for k in 0..n_idx.saturating_sub(2) {
+                        if let (Some(a), Some(b), Some(c)) =
+                            (read_idx(k), read_idx(k + 1), read_idx(k + 2))
+                        {
+                            if a < pos.count && b < pos.count && c < pos.count {
+                                add_tri(a, b, c);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Track whole-scene vertical bounds across all meshes so split BodyFace + Hair
+    // characters compute neck band (72%..87% H) from full character height, not BodyFace alone.
+    let mut scene_min_y = f64::INFINITY;
+    let mut scene_max_y = f64::NEG_INFINITY;
+    for mesh in meshes {
+        for prim in arr(mesh, "primitives") {
+            if let Some(pos_i) = prim
+                .get("attributes")
+                .and_then(|a| a.get("POSITION"))
+                .and_then(as_idx)
+            {
+                if let Some(acc) = arr(json, "accessors").get(pos_i) {
+                    if let (Some(mn), Some(mx)) = (
+                        acc.get("min").and_then(Value::as_array),
+                        acc.get("max").and_then(Value::as_array),
+                    ) {
+                        if mn.len() >= 2 && mx.len() >= 2 {
+                            if let (Some(y0), Some(y1)) = (mn[1].as_f64(), mx[1].as_f64()) {
+                                scene_min_y = scene_min_y.min(y0);
+                                scene_max_y = scene_max_y.max(y1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (mi, mesh) in meshes.iter().enumerate() {
+        let mtag = mesh_tag(meshes, mi);
+        let node_open_sheet = nodes.iter().any(|n| {
+            n.get("mesh").and_then(as_idx) == Some(mi)
+                && n.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_intentional_open_sheet)
+        });
+        let open_sheet_name = is_intentional_open_sheet(&mtag) || node_open_sheet;
+        let mut hb = HygieneBuilder::default();
+
+        for (pi, prim) in arr(mesh, "primitives").iter().enumerate() {
+            let mode = prim.get("mode").and_then(Value::as_u64).unwrap_or(4);
+            if mode != 4 && mode != 5 {
+                continue;
+            }
+            let Some(attrs) = prim.get("attributes") else {
+                continue;
+            };
+            let Some(pos_i) = attrs.get("POSITION").and_then(as_idx) else {
+                continue;
+            };
+            if is_sparse(json, pos_i) {
+                continue;
+            }
+            let Ok(pos) = weights::layout_of(json, bin.len(), pos_i, "POSITION") else {
+                continue;
+            };
+            if pos.component != Component::F32 || pos.width != 3 || pos.count < 3 {
+                continue;
+            }
+
+            let uv_lay: Option<Layout> = match attrs.get("TEXCOORD_0").and_then(as_idx) {
+                Some(ui) if !is_sparse(json, ui) => {
+                    match weights::layout_of(json, bin.len(), ui, "TEXCOORD_0") {
+                        Ok(l)
+                            if l.component == Component::F32
+                                && l.width == 2
+                                && l.count == pos.count =>
+                        {
+                            Some(l)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+
+            let idx_lay: Option<Layout> = match prim.get("indices").and_then(as_idx) {
+                None => None,
+                Some(ii) => {
+                    if is_sparse(json, ii) {
+                        continue;
+                    }
+                    let Ok(lay) = weights::layout_of(json, bin.len(), ii, "indices") else {
+                        continue;
+                    };
+                    if lay.width != 1
+                        || !matches!(
+                            lay.component,
+                            Component::U8 | Component::U16 | Component::U32
+                        )
+                    {
+                        continue;
+                    }
+                    Some(lay)
+                }
+            };
+            let n_idx = idx_lay.map_or(pos.count, |l| l.count);
+            if n_idx < 3 {
+                continue;
+            }
+            let read_idx = |k: usize| -> Option<usize> {
+                match &idx_lay {
+                    Some(lay) => usize::try_from(lay.read_uint(bin, k, 0)?).ok(),
+                    None => Some(k),
+                }
+            };
+
+            let mut uv_stats = uv_lay.as_ref().map(|_| UvPrimStats::default());
+            let mut feed = |a: usize, b: usize, c: usize| {
+                let (Some(pa), Some(pb), Some(pc)) = (
+                    read_vec3(bin, &pos, a),
+                    read_vec3(bin, &pos, b),
+                    read_vec3(bin, &pos, c),
+                ) else {
+                    return;
+                };
+                hb.push_tri(pa, pb, pc);
+                if let (Some(ul), Some(us)) = (uv_lay.as_ref(), uv_stats.as_mut()) {
+                    if let (Some(ua), Some(ub), Some(uc)) = (
+                        read_vec2(bin, ul, a),
+                        read_vec2(bin, ul, b),
+                        read_vec2(bin, ul, c),
+                    ) {
+                        us.push_tri(pa, pb, pc, ua, ub, uc);
+                    }
+                }
+            };
+
+            if mode == 4 {
+                let mut k = 0usize;
+                while k + 2 < n_idx {
+                    if let (Some(a), Some(b), Some(c)) =
+                        (read_idx(k), read_idx(k + 1), read_idx(k + 2))
+                    {
+                        if a < pos.count && b < pos.count && c < pos.count {
+                            feed(a, b, c);
+                        }
+                    }
+                    k += 3;
+                }
+            } else {
+                for k in 0..n_idx - 2 {
+                    if let (Some(a), Some(b), Some(c)) =
+                        (read_idx(k), read_idx(k + 1), read_idx(k + 2))
+                    {
+                        if a < pos.count && b < pos.count && c < pos.count {
+                            if k % 2 == 0 {
+                                feed(a, b, c);
+                            } else {
+                                feed(a, c, b);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Evaluate per-primitive UV shredding / stretch distortion.
+            if let Some(mut us) = uv_stats {
+                if us.valid_tris >= 12 {
+                    let aniso_pct = (us.aniso_gt8 as f64) * 100.0 / (us.valid_tris as f64);
+                    let zero_pct = (us.zero_uv_tris as f64) * 100.0 / (us.valid_tris as f64);
+                    let mut spread = 1.0f64;
+                    if us.ratios.len() >= 50 {
+                        us.ratios.sort_by(|a, b| a.total_cmp(b));
+                        let p5 = us.ratios[(us.ratios.len() * 5) / 100].max(1e-12);
+                        let p95 =
+                            us.ratios[((us.ratios.len() * 95) / 100).min(us.ratios.len() - 1)];
+                        spread = p95 / p5;
+                    }
+                    let charts = us.chart_count();
+                    let avg_tris_per_chart = (us.valid_tris as f64) / (charts.max(1) as f64);
+
+                    let bad_aniso = us.aniso_gt8 >= 5 && aniso_pct >= 1.5;
+                    let bad_spread = us.ratios.len() >= 50 && spread > 25.0;
+                    // Only flag zero-UV collapse if the mesh actually uses non-zero UVs elsewhere
+                    let has_real_uv = us.ratios.len() >= us.valid_tris / 4;
+                    let bad_zero = has_real_uv && us.zero_uv_tris >= 5 && zero_pct >= 2.0;
+                    let bad_shred_charts =
+                        us.valid_tris >= 500 && charts > 200 && avg_tris_per_chart < 35.0;
+
+                    if bad_aniso || bad_spread || bad_zero || bad_shred_charts {
+                        out.push((
+                            "M_UV_SHRED",
+                            format!(
+                                "{mtag} prim {pi}: distorted/shredded UVs \
+                                 (aniso>8x: {} [{aniso_pct:.1}%], spread p95/p5: {spread:.1}x, \
+                                 zero-UV tris: {}, charts: {charts} across {} tris)",
+                                us.aniso_gt8, us.zero_uv_tris, us.valid_tris
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
+        if hb.valid_tris == 0 && hb.welded.len() <= 1 {
+            // All-zero placeholder geometry buffer (no distinct vertex positions): skip hygiene.
+            continue;
+        }
+
+        if hb.degenerate_tris > 0 {
+            out.push((
+                "M_DEGENERATE_TRI",
+                format!(
+                    "{mtag}: {} degenerate triangle{} (zero area or duplicate vertices)",
+                    hb.degenerate_tris,
+                    if hb.degenerate_tris == 1 { "" } else { "s" }
+                ),
+            ));
+        }
+
+        if hb.valid_tris == 0 {
+            continue;
+        }
+
+        let eff_min_y = if scene_min_y.is_finite() {
+            scene_min_y.min(hb.min_y)
+        } else {
+            hb.min_y
+        };
+        let eff_max_y = if scene_max_y.is_finite() {
+            scene_max_y.max(hb.max_y)
+        } else {
+            hb.max_y
+        };
+        let height = (eff_max_y - eff_min_y).max(0.0);
+        let width_x = (hb.max_x - hb.min_x).max(0.0);
+        let depth_z = (hb.max_z - hb.min_z).max(0.0);
+        let is_humanoid = height > 0.3 && height > 1.2 * depth_z && height > 0.8 * width_x;
+        let neck_lo = eff_min_y + 0.72 * height;
+        let neck_hi = eff_min_y + 0.87 * height;
+
+        if is_humanoid {
+            for (i, &is_s) in hb.tri_is_sliver.iter().enumerate() {
+                if is_s {
+                    let cy = hb.tri_centers_y[i];
+                    if cy >= neck_lo && cy <= neck_hi {
+                        hb.neck_sliver_tris += 1;
+                    }
+                }
+            }
+        }
+
+        // Reverse lookup from welded vertex id to quantized coordinate key for cross-mesh seam check.
+        let mut id_to_key: Vec<[i64; 3]> = vec![[0; 3]; hb.parent.len()];
+        if meshes.len() > 1 {
+            for (&k, &id) in &hb.welded {
+                if id < id_to_key.len() {
+                    id_to_key[id] = k;
+                }
+            }
+        }
+
+        let total_edges = hb.edges.len();
+        let mut open_edges = 0usize;
+        let mut neck_open_edges = 0usize;
+        let mut non_manifold_edges = 0usize;
+        let mut inconsistent_winding_edges = 0usize;
+        let mut self_fold_edges = 0usize;
+
+        for (&(u, v), edge) in &hb.edges {
+            if edge.count == 1 {
+                let stitched_by_sibling = if meshes.len() > 1 {
+                    let ku = id_to_key[u];
+                    let kv = id_to_key[v];
+                    let gk = if ku < kv { (ku, kv) } else { (kv, ku) };
+                    global_edge_counts.get(&gk).copied().unwrap_or(1) >= 2
+                } else {
+                    false
+                };
+                if !stitched_by_sibling {
+                    open_edges += 1;
+                    if is_humanoid && edge.mid_y >= neck_lo && edge.mid_y <= neck_hi {
+                        neck_open_edges += 1;
+                    }
+                }
+            } else if edge.count == 2 {
+                if edge.bal != 0 {
+                    inconsistent_winding_edges += 1;
+                } else {
+                    let d = dot(edge.normals[0], edge.normals[1]);
+                    if d < SELF_FOLD_MAX_DOT {
+                        self_fold_edges += 1;
+                    }
+                }
+            } else if edge.count > 2 {
+                non_manifold_edges += 1;
+            }
+        }
+
+        if non_manifold_edges > 0 {
+            out.push((
+                "M_NON_MANIFOLD",
+                format!(
+                    "{mtag}: {non_manifold_edges} non-manifold edge{} (> 2 faces)",
+                    if non_manifold_edges == 1 { "" } else { "s" }
+                ),
+            ));
+        }
+
+        if inconsistent_winding_edges > 0 {
+            out.push((
+                "M_INCONSISTENT_WINDING",
+                format!(
+                    "{mtag}: {inconsistent_winding_edges} edge{} with conflicting adjacent face winding",
+                    if inconsistent_winding_edges == 1 { "" } else { "s" }
+                ),
+            ));
+        }
+
+        // Open edges on mostly-closed meshes (ignore tiny <12-tri test snippets and
+        // intentional open cards/sheets/planes where >25% of edges are boundary).
+        let mostly_closed = hb.valid_tris >= 12 && total_edges > 0 && open_edges * 4 <= total_edges;
+        if !open_sheet_name && mostly_closed && open_edges > 0 {
+            out.push((
+                "M_OPEN_EDGE",
+                format!(
+                    "{mtag}: {open_edges} open boundary edge{} on mostly-closed mesh ({} tris)",
+                    if open_edges == 1 { "" } else { "s" },
+                    hb.valid_tris
+                ),
+            ));
+            if is_humanoid && neck_open_edges >= 2 {
+                out.push((
+                    "M_NECK_CRACK",
+                    format!(
+                        "{mtag}: {neck_open_edges} open boundary edges in neck band \
+                         ({neck_lo:.3}..{neck_hi:.3}m)"
+                    ),
+                ));
+            }
+        }
+
+        // Connected-component speck check (< 0.5% of total area on multi-island meshes).
+        let mut comp_area: BTreeMap<usize, (f64, usize)> = BTreeMap::new();
+        let mut total_area = 0.0f64;
+        for i in 0..hb.tri_comp_root.len() {
+            let root = hb.find(hb.tri_comp_root[i]);
+            let a = hb.tri_area[i];
+            total_area += a;
+            let entry = comp_area.entry(root).or_insert((0.0, 0));
+            entry.0 += a;
+            entry.1 += 1;
+        }
+        if comp_area.len() >= 2 && total_area > 0.0 {
+            let max_speck_tris = (hb.valid_tris / 200).max(32);
+            let mut speck_islands = 0usize;
+            let mut speck_tris = 0usize;
+            for &(ca, ct) in comp_area.values() {
+                if ca < 0.005 * total_area && ct <= max_speck_tris {
+                    speck_islands += 1;
+                    speck_tris += ct;
+                }
+            }
+            if speck_islands > 0 {
+                out.push((
+                    "M_SPECK",
+                    format!(
+                        "{mtag}: {speck_islands} tiny disconnected island{} (< 0.5% surface area, \
+                         {speck_tris} tris total)",
+                        if speck_islands == 1 { "" } else { "s" }
+                    ),
+                ));
+            }
+        }
+
+        // Slivers (< 8 deg min interior angle).
+        let sliver_pct = (hb.sliver_tris as f64) * 100.0 / (hb.valid_tris as f64);
+        let bad_sliver = (hb.sliver_tris >= 3 && (sliver_pct >= 0.5 || hb.sliver_tris >= 25))
+            || (is_humanoid && hb.neck_sliver_tris >= 5);
+        if bad_sliver {
+            out.push((
+                "M_SLIVER",
+                format!(
+                    "{mtag}: {} sliver triangles (< {SLIVER_MIN_ANGLE_DEG:.0} deg, {sliver_pct:.2}%, \
+                     neck={}, worst {:.2} deg)",
+                    hb.sliver_tris, hb.neck_sliver_tris, hb.worst_sliver_deg
+                ),
+            ));
+        }
+
+        // Self-folds (acute fold-back creases on manifold edges).
+        let fold_pct = if total_edges > 0 {
+            (self_fold_edges as f64) * 100.0 / (total_edges as f64)
+        } else {
+            0.0
+        };
+        if self_fold_edges >= 3 && (fold_pct >= 0.2 || self_fold_edges >= 15) {
+            out.push((
+                "M_FOLD",
+                format!(
+                    "{mtag}: {self_fold_edges} acute self-fold manifold edges ({fold_pct:.2}%, \
+                     dihedral < 81 deg)"
+                ),
+            ));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use crate::budget::AssetClass;
@@ -947,5 +1802,292 @@ mod tests {
                 "{mesh_name} should skip inward shell check"
             );
         }
+    }
+
+    fn warn_codes(bytes: &[u8]) -> Vec<&'static str> {
+        let r = checks::check_glb_with_class(bytes, None, Some(AssetClass::Prop));
+        r.warnings().iter().map(|d| d.code).collect()
+    }
+
+    fn strict_codes(bytes: &[u8]) -> Vec<&'static str> {
+        let opts = checks::CheckOpts {
+            strict_mesh: true,
+            ..Default::default()
+        };
+        let r = checks::check_glb_with_opts(bytes, None, Some(AssetClass::Prop), &opts);
+        r.diags.iter().map(|d| d.code).collect()
+    }
+
+    fn build_uv_mesh_glb(
+        name: &str,
+        positions: &[[f32; 3]],
+        uvs: Option<&[[f32; 2]]>,
+        indices: &[u16],
+    ) -> Vec<u8> {
+        let mut bin = Vec::new();
+        for p in positions {
+            for &x in p {
+                bin.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        let pos_len = bin.len();
+        let mut views = vec![json!({"buffer": 0, "byteOffset": 0, "byteLength": pos_len})];
+        let mut accs = vec![
+            json!({"bufferView": 0, "componentType": 5126, "count": positions.len(), "type": "VEC3"}),
+        ];
+        let mut attrs = json!({"POSITION": 0});
+        if let Some(uv) = uvs {
+            let uv_off = bin.len();
+            for u in uv {
+                for &x in u {
+                    bin.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            let uv_len = bin.len() - uv_off;
+            let vi = views.len();
+            views.push(json!({"buffer": 0, "byteOffset": uv_off, "byteLength": uv_len}));
+            accs.push(
+                json!({"bufferView": vi, "componentType": 5126, "count": uv.len(), "type": "VEC2"}),
+            );
+            attrs["TEXCOORD_0"] = json!(vi);
+        }
+        let idx_off = bin.len();
+        for &i in indices {
+            bin.extend_from_slice(&i.to_le_bytes());
+        }
+        let idx_len = bin.len() - idx_off;
+        let iv = views.len();
+        views.push(json!({"buffer": 0, "byteOffset": idx_off, "byteLength": idx_len}));
+        accs.push(json!({"bufferView": iv, "componentType": 5123, "count": indices.len(), "type": "SCALAR"}));
+        let doc = json!({
+            "asset": {"version": "2.0"},
+            "scenes": [{"nodes": [0]}],
+            "nodes": [{"name": name, "mesh": 0}],
+            "meshes": [{"name": name, "primitives": [{"attributes": attrs, "indices": iv}]}],
+            "buffers": [{"byteLength": bin.len()}],
+            "bufferViews": views,
+            "accessors": accs,
+        });
+        pack_bin(&doc, &bin)
+    }
+
+    fn closed_capsule_humanoid(open_neck_crack: bool) -> Vec<u8> {
+        // Closed 1.75m tall humanoid-proportioned cylinder+caps (glTF Y-up).
+        let segs = 16usize;
+        let rings = 14usize;
+        let mut pos: Vec<[f32; 3]> = Vec::new();
+        let mut idx: Vec<u16> = Vec::new();
+        pos.push([0.0, 0.0, 0.0]); // bottom center = 0
+        for r in 0..=rings {
+            let t = (r as f32) / (rings as f32);
+            let y = 0.02 + t * 1.71;
+            let rad = if (0.75..=0.85).contains(&t) {
+                0.06
+            } else {
+                0.14
+            };
+            for s in 0..segs {
+                let a = 2.0 * std::f32::consts::PI * (s as f32) / (segs as f32);
+                pos.push([rad * a.cos(), y, rad * a.sin()]);
+            }
+        }
+        let top_c = pos.len() as u16;
+        pos.push([0.0, 1.75, 0.0]);
+        for s in 0..segs {
+            let a = 1 + s;
+            let b = 1 + (s + 1) % segs;
+            idx.extend_from_slice(&[0, a as u16, b as u16]);
+        }
+        for r in 0..rings {
+            let row0 = 1 + r * segs;
+            let row1 = 1 + (r + 1) * segs;
+            // Ring 11 sits around y ~= 1.38m (~79% height = neck band)
+            for s in 0..segs {
+                if open_neck_crack && r == 11 && s < 4 {
+                    continue;
+                }
+                let s1 = (s + 1) % segs;
+                let a = (row0 + s) as u16;
+                let b = (row0 + s1) as u16;
+                let c = (row1 + s1) as u16;
+                let d = (row1 + s) as u16;
+                idx.extend_from_slice(&[a, c, b, a, d, c]);
+            }
+        }
+        let last = 1 + rings * segs;
+        for s in 0..segs {
+            let a = (last + s) as u16;
+            let b = (last + (s + 1) % segs) as u16;
+            idx.extend_from_slice(&[a, top_c, b]);
+        }
+        build_uv_mesh_glb("Hero_BodyFace", &pos, None, &idx)
+    }
+
+    #[test]
+    fn clean_closed_cube_passes_all_hygiene_checks() {
+        let (pos, nrm, idx) = unit_cube(false);
+        let glb = build_mesh_glb(&pos, &nrm, Some(&idx), None, false, None);
+        assert!(warn_codes(&glb).is_empty(), "got: {:?}", warn_codes(&glb));
+        assert!(
+            strict_codes(&glb).is_empty(),
+            "got: {:?}",
+            strict_codes(&glb)
+        );
+    }
+
+    #[test]
+    fn planted_open_edge_and_neck_crack_detected() {
+        let clean = closed_capsule_humanoid(false);
+        assert!(
+            warn_codes(&clean).is_empty(),
+            "clean humanoid warned: {:?}",
+            warn_codes(&clean)
+        );
+
+        let cracked = closed_capsule_humanoid(true);
+        let w = warn_codes(&cracked);
+        assert!(
+            w.contains(&"M_OPEN_EDGE"),
+            "expected M_OPEN_EDGE, got {w:?}"
+        );
+        assert!(
+            w.contains(&"M_NECK_CRACK"),
+            "expected M_NECK_CRACK, got {w:?}"
+        );
+        assert!(strict_codes(&cracked).contains(&"M_NECK_CRACK"));
+    }
+
+    #[test]
+    fn planted_non_manifold_edge_detected() {
+        let (mut pos, _, mut idx) = unit_cube(false);
+        // Add a 3rd fin triangle attached to an existing cube edge (0, 1).
+        let tip = pos.len() as u16;
+        pos.push([0.5, 0.5, 2.0]);
+        idx.extend_from_slice(&[0, 1, tip]);
+        let glb = build_uv_mesh_glb("BoxFin", &pos, None, &idx);
+        assert!(warn_codes(&glb).contains(&"M_NON_MANIFOLD"));
+        assert!(strict_codes(&glb).contains(&"M_NON_MANIFOLD"));
+    }
+
+    #[test]
+    fn planted_degenerate_triangle_detected() {
+        let (pos, _, mut idx) = unit_cube(false);
+        idx.extend_from_slice(&[0, 0, 1]);
+        let glb = build_uv_mesh_glb("BoxDeg", &pos, None, &idx);
+        assert!(warn_codes(&glb).contains(&"M_DEGENERATE_TRI"));
+        assert!(strict_codes(&glb).contains(&"M_DEGENERATE_TRI"));
+    }
+
+    #[test]
+    fn planted_inconsistent_winding_detected() {
+        let (pos, _, mut idx) = unit_cube(false);
+        // Flip one triangle's winding so it disagrees with its neighbors.
+        idx.swap(1, 2);
+        let glb = build_uv_mesh_glb("BoxWind", &pos, None, &idx);
+        assert!(warn_codes(&glb).contains(&"M_INCONSISTENT_WINDING"));
+    }
+
+    #[test]
+    fn planted_speck_island_detected() {
+        let (mut pos, _, mut idx) = unit_cube(false);
+        let b = pos.len() as u16;
+        // Tiny 0.005m floating speck tetrahedron (< 0.5% of cube area 6.0).
+        pos.extend_from_slice(&[
+            [3.0, 3.0, 3.0],
+            [3.005, 3.0, 3.0],
+            [3.0, 3.005, 3.0],
+            [3.0, 3.0, 3.005],
+        ]);
+        idx.extend_from_slice(&[
+            b,
+            b + 2,
+            b + 1,
+            b,
+            b + 1,
+            b + 3,
+            b + 1,
+            b + 2,
+            b + 3,
+            b + 2,
+            b,
+            b + 3,
+        ]);
+        let glb = build_uv_mesh_glb("BoxSpeck", &pos, None, &idx);
+        assert!(warn_codes(&glb).contains(&"M_SPECK"));
+    }
+
+    #[test]
+    fn planted_sliver_fan_detected() {
+        let (mut pos, _, mut idx) = unit_cube(false);
+        // Add a fan of 6 ultra-thin < 4 deg needle triangles.
+        let base = pos.len() as u16;
+        pos.push([2.0, 0.0, 0.0]);
+        for i in 0..7 {
+            pos.push([3.0, 0.015 * (i as f32), 0.0]);
+        }
+        for i in 0..6u16 {
+            idx.extend_from_slice(&[base, base + 1 + i, base + 2 + i]);
+        }
+        let glb = build_uv_mesh_glb("SliverMesh", &pos, None, &idx);
+        assert!(warn_codes(&glb).contains(&"M_SLIVER"));
+        assert!(strict_codes(&glb).contains(&"M_SLIVER"));
+    }
+
+    #[test]
+    fn planted_acute_self_fold_detected() {
+        // Build a flat sheet with 4 triangles folded sharply >140 deg back on themselves.
+        let mut pos: Vec<[f32; 3]> = Vec::new();
+        let mut idx: Vec<u16> = Vec::new();
+        for i in 0..4 {
+            let x0 = i as f32;
+            let b = pos.len() as u16;
+            // Two adjacent triangles sharing edge (b, b+1):
+            // tri0 lies in z=0 (+Y), tri1 folds almost completely back over tri0 (z=0.05, +Y)
+            // so their outward normals point almost opposite (dot < -0.9).
+            pos.push([x0, 0.0, 0.0]);
+            pos.push([x0 + 0.8, 0.0, 0.0]);
+            pos.push([x0 + 0.4, 1.0, 0.0]);
+            pos.push([x0 + 0.4, 0.95, 0.08]);
+            idx.extend_from_slice(&[b, b + 1, b + 2, b + 1, b, b + 3]);
+        }
+        let glb = build_uv_mesh_glb("FoldedMesh", &pos, None, &idx);
+        assert!(warn_codes(&glb).contains(&"M_FOLD"));
+        assert!(strict_codes(&glb).contains(&"M_FOLD"));
+    }
+
+    #[test]
+    fn planted_shredded_uvs_detected_and_clean_uvs_pass() {
+        // 6x6 quad grid = 72 triangles.
+        let n = 6usize;
+        let mut pos: Vec<[f32; 3]> = Vec::new();
+        let mut uv_clean: Vec<[f32; 2]> = Vec::new();
+        let mut uv_bad: Vec<[f32; 2]> = Vec::new();
+        let mut idx: Vec<u16> = Vec::new();
+        for y in 0..=n {
+            for x in 0..=n {
+                let fx = (x as f32) / (n as f32);
+                let fy = (y as f32) / (n as f32);
+                pos.push([fx, fy, 0.0]);
+                uv_clean.push([fx, fy]);
+                // Plant extreme anisotropic stretch (>20x) on a strip of vertices
+                let bad_u = if x == 2 { fx + 0.45 } else { fx * 0.05 };
+                uv_bad.push([bad_u, fy]);
+            }
+        }
+        for y in 0..n {
+            for x in 0..n {
+                let a = (y * (n + 1) + x) as u16;
+                let b = a + 1;
+                let c = a + (n + 1) as u16;
+                let d = c + 1;
+                idx.extend_from_slice(&[a, b, d, a, d, c]);
+            }
+        }
+        let clean_glb = build_uv_mesh_glb("PlaneClean", &pos, Some(&uv_clean), &idx);
+        assert!(!warn_codes(&clean_glb).contains(&"M_UV_SHRED"));
+
+        let bad_glb = build_uv_mesh_glb("PlaneShred", &pos, Some(&uv_bad), &idx);
+        assert!(warn_codes(&bad_glb).contains(&"M_UV_SHRED"));
+        assert!(strict_codes(&bad_glb).contains(&"M_UV_SHRED"));
     }
 }

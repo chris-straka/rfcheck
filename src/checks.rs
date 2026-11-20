@@ -6,9 +6,21 @@ use crate::budget;
 use crate::defects;
 use crate::glb;
 use crate::mesh;
+use crate::reference;
 use crate::util::{arr, join_names, plural};
 use crate::weights;
 use serde_json::{json, Value};
+
+#[derive(Default)]
+pub struct CheckOpts<'a> {
+    pub bevy: bevy::BevyOpts<'a>,
+    /// Promote warn-level `M_*` mesh-hygiene and character-conversion checks into
+    /// contract failures (`diags`, exit 1).
+    pub strict_mesh: bool,
+    /// Optional reference source GLB bytes for `M_FOLD` (>35 deg off reference)
+    /// and talk-cam `M_SILHOUETTE_DRIFT` (>1.5 px).
+    pub reference: Option<&'a [u8]>,
+}
 
 pub struct Diag {
     pub code: &'static str,
@@ -105,11 +117,28 @@ pub fn check_glb_with_class(
     check_glb_full(bytes, budget, class, &bevy::BevyOpts::default())
 }
 
+#[cfg(test)]
 pub fn check_glb_full(
     bytes: &[u8],
     budget: Option<&budget::Budget>,
     class: Option<budget::AssetClass>,
     opts: &bevy::BevyOpts,
+) -> Report {
+    let full_opts = CheckOpts {
+        bevy: bevy::BevyOpts {
+            codecs: opts.codecs,
+        },
+        strict_mesh: false,
+        reference: None,
+    };
+    check_glb_with_opts(bytes, budget, class, &full_opts)
+}
+
+pub fn check_glb_with_opts(
+    bytes: &[u8],
+    budget: Option<&budget::Budget>,
+    class: Option<budget::AssetClass>,
+    opts: &CheckOpts,
 ) -> Report {
     let doc = match glb::parse(bytes) {
         Ok(d) => d,
@@ -220,16 +249,52 @@ pub fn check_glb_full(
         diags.push(Diag { code, detail });
     }
 
-    for (code, detail) in bevy::check_bevy(json, doc.bin, opts) {
+    for (code, detail) in bevy::check_bevy(json, doc.bin, &opts.bevy) {
         diags.push(Diag { code, detail });
     }
 
-    let warns: Option<Vec<Diag>> = budget.map(|b| {
-        budget::check_budgets(json, doc.bin, b, class, &skin)
-            .into_iter()
-            .map(|(code, detail)| Diag { code, detail })
-            .collect()
-    });
+    let mut mesh_hygiene: Vec<Diag> = mesh::check_mesh_hygiene(json, doc.bin)
+        .into_iter()
+        .map(|(code, detail)| Diag { code, detail })
+        .collect();
+    if let Some(ref_bytes) = opts.reference {
+        match reference::check_against_reference(json, doc.bin, ref_bytes) {
+            Ok(ref_findings) => {
+                for (code, detail) in ref_findings {
+                    mesh_hygiene.push(Diag { code, detail });
+                }
+            }
+            Err(e) => {
+                diags.push(Diag {
+                    code: "R_IO",
+                    detail: e,
+                });
+            }
+        }
+    }
+
+    let warns: Option<Vec<Diag>> = if opts.strict_mesh {
+        diags.extend(mesh_hygiene);
+        budget.map(|b| {
+            budget::check_budgets(json, doc.bin, b, class, &skin)
+                .into_iter()
+                .map(|(code, detail)| Diag { code, detail })
+                .collect()
+        })
+    } else {
+        match budget {
+            Some(b) => {
+                let mut w: Vec<Diag> = budget::check_budgets(json, doc.bin, b, class, &skin)
+                    .into_iter()
+                    .map(|(code, detail)| Diag { code, detail })
+                    .collect();
+                w.extend(mesh_hygiene);
+                Some(w)
+            }
+            None if !mesh_hygiene.is_empty() => Some(mesh_hygiene),
+            None => None,
+        }
+    };
 
     let mut summary = format!(
         "{} joint{}, {} mesh{}, {} clip{}",
